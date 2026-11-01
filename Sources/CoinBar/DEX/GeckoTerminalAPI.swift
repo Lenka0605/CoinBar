@@ -33,12 +33,16 @@ enum GeckoTerminalAPI {
         return comps?.url
     }
 
-    static func tokensMultiURL(network: String, addresses: [String]) -> URL? {
+    static func tokensMultiURL(network: String, addresses: [String], includeTopPools: Bool = false) -> URL? {
         guard !addresses.isEmpty else { return nil }
         let list = addresses
             .map { $0.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? $0 }
             .joined(separator: ",")
-        return URL(string: "\(baseURL.absoluteString)/networks/\(network)/tokens/multi/\(list)")
+        var comps = URLComponents(string: "\(baseURL.absoluteString)/networks/\(network)/tokens/multi/\(list)")
+        if includeTopPools {
+            comps?.queryItems = [URLQueryItem(name: "include", value: "top_pools")]
+        }
+        return comps?.url
     }
 
     /// 带重试的 GET。429 会退避（5s / 10s），网络错误重试一次。
@@ -145,6 +149,20 @@ enum GeckoTerminalAPI {
 
 struct GTResponse<T: Decodable>: Decodable {
     let data: [T]?
+    /// `?include=top_pools` 时随 token 一起返回的池子信息
+    let included: [GTPoolSummary]?
+}
+
+/// included 里的池子（只取算涨跌幅需要的字段）。
+/// 字段全部可选，这样即使 included 里混了别的类型也不会让整个响应解析失败。
+struct GTPoolSummary: Decodable {
+    let id: String?
+    let attributes: Attributes?
+
+    struct Attributes: Decodable {
+        let reserveInUsd: DexNumber?
+        let priceChangePercentage: [String: DexNumber]?
+    }
 }
 
 struct GTPool: Decodable {
@@ -177,6 +195,7 @@ struct GTPool: Decodable {
 struct GTToken: Decodable {
     let id: String
     let attributes: Attributes
+    let relationships: Relationships?
 
     struct Attributes: Decodable {
         let address: String?
@@ -185,6 +204,18 @@ struct GTToken: Decodable {
         let imageUrl: String?
         let priceUsd: DexNumber?
         let totalReserveInUsd: DexNumber?
+    }
+
+    struct Relationships: Decodable {
+        let topPools: TopPools?
+
+        struct TopPools: Decodable {
+            let data: [Ref]?
+        }
+
+        struct Ref: Decodable {
+            let id: String
+        }
     }
 }
 

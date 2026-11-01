@@ -318,13 +318,14 @@ final class DEXProvider: PriceProvider {
                 didRequest = true
                 attempted += 1
 
-                guard let url = GeckoTerminalAPI.tokensMultiURL(network: network, addresses: chunk) else {
+                // include=top_pools 顺带拿池子信息，用来算 24h 涨跌幅
+                guard let url = GeckoTerminalAPI.tokensMultiURL(network: network, addresses: chunk, includeTopPools: true) else {
                     failed += 1
                     continue
                 }
                 do {
                     let response = try await GeckoTerminalAPI.get(url, as: GTResponse<GTToken>.self, maxAttempts: 2)
-                    emitGecko(tokens: response.data ?? [], network: network, entries: entries)
+                    emitGecko(tokens: response.data ?? [], included: response.included ?? [], network: network, entries: entries)
                 } catch is CancellationError {
                     return nil
                 } catch let err as DexScreenerError {
@@ -341,13 +342,26 @@ final class DEXProvider: PriceProvider {
         return lastError ?? .unknown
     }
 
-    private func emitGecko(tokens: [GTToken], network: String, entries: [(address: String, coin: Coin)]) {
+    private func emitGecko(tokens: [GTToken], included: [GTPoolSummary], network: String,
+                           entries: [(address: String, coin: Coin)]) {
         let chainId = GeckoTerminalAPI.dexChainId(fromNetwork: network)
         let now = Date()
+
+        var poolsByID: [String: GTPoolSummary] = [:]
+        for pool in included {
+            if let id = pool.id { poolsByID[id] = pool }
+        }
 
         for token in tokens {
             guard let address = token.attributes.address,
                   let price = token.attributes.priceUsd?.value, price > 0 else { continue }
+
+            // 同一个币有多个池子，取流动性最大那个的 24h 涨跌幅
+            let topPools = token.relationships?.topPools?.data ?? []
+            let bestPool = topPools
+                .compactMap { poolsByID[$0.id] }
+                .max { ($0.attributes?.reserveInUsd?.value ?? 0) < ($1.attributes?.reserveInUsd?.value ?? 0) }
+            let change24h = bestPool?.attributes?.priceChangePercentage?["h24"]?.value
 
             for entry in entries where DexCandidates.addressEquals(entry.address, address) {
                 guard case .dex(let coinChainId, _) = entry.coin.source,
@@ -355,7 +369,7 @@ final class DEXProvider: PriceProvider {
                 let tick = PriceTick(
                     coinId: entry.coin.id,
                     priceUSD: price,
-                    change24h: nil,   // tokens/multi 不返回 24h 涨跌幅
+                    change24h: change24h,
                     timestamp: now
                 )
                 onTick?(tick)

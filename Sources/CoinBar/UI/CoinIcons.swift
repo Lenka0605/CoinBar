@@ -47,7 +47,7 @@ final class CoinIcons: ObservableObject {
             return sized(img, size)
         }
         let remotes = remoteURLs(coin)
-        if !remotes.isEmpty { fetch(remotes, key: key, to: file) }
+        if !remotes.isEmpty || isDex(coin) { fetch(remotes, key: key, to: file, coin: coin) }
         return placeholder(coin.symbol, size: size)
     }
 
@@ -79,6 +79,15 @@ final class CoinIcons: ObservableObject {
         return preferred + list.filter { !preferred.contains($0) }
     }
 
+    private static func download(_ url: URL) async -> (Data, NSImage)? {
+        var req = URLRequest(url: url, timeoutInterval: 6)
+        req.setValue("Mozilla/5.0 CoinBar", forHTTPHeaderField: "User-Agent")
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let img = NSImage(data: data), img.isValid else { return nil }
+        return (data, img)
+    }
+
     /// 不需要 key 的公开图标库（Ave 图标 CDN 大陆可直连；DexScreener 海外可用）
     static func derivedIconURLs(chain: String, address: String) -> [URL] {
         let isEVM = address.hasPrefix("0x")
@@ -93,19 +102,22 @@ final class CoinIcons: ObservableObject {
     }
 
     /// 依次尝试每个地址，拿到第一张有效图片就停
-    private func fetch(_ urls: [URL], key: String, to file: URL) {
+    private func isDex(_ coin: Coin) -> Bool { if case .dex = coin.source { return true }; return false }
+
+    private func fetch(_ urls: [URL], key: String, to file: URL, coin: Coin) {
         guard !inFlight.contains(key), !failed.contains(key) else { return }
         inFlight.insert(key)
         Task {
             var got: (Data, NSImage)?
             for url in urls {
-                var req = URLRequest(url: url, timeoutInterval: 6)
-                req.setValue("Mozilla/5.0 CoinBar", forHTTPHeaderField: "User-Agent")
-                if let (data, resp) = try? await URLSession.shared.data(for: req),
-                   (resp as? HTTPURLResponse)?.statusCode == 200,
-                   let img = NSImage(data: data), img.isValid {
-                    got = (data, img); break
+                if let r = await Self.download(url) { got = r; break }
+            }
+            // 公开图标库都没有：后台打开 Ave 网页读图标地址（链上币才做，每个币成功一次后走磁盘缓存）
+            if got == nil, case .dex(let chain, let address) = coin.source {
+                let found: URL? = await withCheckedContinuation { cont in
+                    Task { @MainActor in AveWebIcon.shared.lookup(chain: chain, address: address) { cont.resume(returning: $0) } }
                 }
+                if let found { got = await Self.download(found) }
             }
             await MainActor.run {
                 self.inFlight.remove(key)

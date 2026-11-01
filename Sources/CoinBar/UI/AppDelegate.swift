@@ -32,6 +32,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusBar.openSettings = { [weak self] in self?.showSettings() }
 
         if ProcessInfo.processInfo.environment["COINBAR_OPEN_SETTINGS"] != nil { showSettings() }
+        // 调试：COINBAR_SELFUPDATE=1 启动即检查并自动安装更新（用于验证自更新链路）
+        if ProcessInfo.processInfo.environment["COINBAR_SELFUPDATE"] != nil {
+            Task {
+                await Updater.shared.check()
+                print("update state:", Updater.shared.state)
+                if case .available = Updater.shared.state { await Updater.shared.downloadAndInstall() }
+                print("update state:", Updater.shared.state)
+            }
+        }
         // 启动 5 秒后静默检查一次，之后每 6 小时一次
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { Task { await Updater.shared.check(silent: true) } }
         updateTimer = Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { _ in

@@ -8,7 +8,8 @@ Mac 菜单栏实时币价。默认 BTC / ETH / SOL / BNB / DOGE / XRP，可按�
 
 ## 安装
 1. 在 [Releases](https://github.com/Lenka0605/CoinBar/releases/latest) 下载 `CoinBar-x.y.z.zip`，解压后把 `CoinBar.app` 拖进「应用程序」
-2. 首次打开：右键 CoinBar.app →「打开」→ 再点「打开」（App 未经苹果公证，只需这一次）
+2. 首次打开（App 未经苹果公证，只需这一次）：双击后如果提示「无法验证开发者」，打开「系统设置 → 隐私与安全性」，在页面下方点「仍要打开」。
+   或者在终端执行：`xattr -dr com.apple.quarantine /Applications/CoinBar.app`
 3. 之后在菜单栏点击价格即可添加币种、设置开机启动、检查更新
 
 系统要求：macOS 13 及以上，Apple 芯片与 Intel 均可。

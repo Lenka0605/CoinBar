@@ -29,6 +29,7 @@
 ## 多源兜底原则（老板 2026-11-01 定）
 能接的数据源都接上，按顺序排，一个用不了自动换下一个。价格、图标都这样。
 - 交易所币价格：Gate WS → Binance vision WS → Gate REST 每 60 秒补价
-- 链上币价格：Ave（需 key，大陆可用）→ DexScreener（~10s）→ GeckoTerminal（~30s）→ LI.FI（大陆可用，~5 分钟缓存）→ BSC 读链（publicnode/drpc/1rpc，大陆可用，规划中）
-- 图标：内置图标 → 磁盘缓存 → `Coin.iconURL` + `Coin.altIconURLs` 依次尝试（Ave iconaves.com 大陆可用 / DexScreener / GeckoTerminal / LI.FI）→ Gate CDN → 首字母占位
-- Ave key 放在 `AppConfig.aveAPIKey`，为空时自动跳过 Ave
+- 链上币价格：DexScreener（~10s）→ GeckoTerminal（~30s）→ LI.FI（大陆可用，~5 分钟缓存）→ BSC 读链（publicnode/drpc/1rpc，大陆可用）
+- 不用任何需要注册 key 的服务（老板定：Ave 需 key，放弃）
+- 图标：内置图标（市值前 500）→ 磁盘缓存 → `Coin.iconURL` + `Coin.altIconURLs` 依次尝试（LI.FI logoURI 若在 static.debank.com 大陆可用 / DexScreener / GeckoTerminal）→ Gate CDN → 首字母占位
+- 大陆图标域名实测：static.debank.com 三网通；cdn.jsdelivr.net 仅电信通；tokens.pancakeswap.finance、coin-images.coingecko.com、arweave.net 不通

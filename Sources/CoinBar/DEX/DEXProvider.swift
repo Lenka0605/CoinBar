@@ -168,6 +168,10 @@ final class DEXProvider: PriceProvider {
                 waited += slice
 
                 if takeKick() { break }
+                // 读链到期就提前醒来，保证 BSC 币约 15 秒刷新一次
+                if !rpcKeys.isEmpty, Date().timeIntervalSince(lastRPCRefresh) >= rpcInterval {
+                    break
+                }
             }
         }
     }
@@ -371,15 +375,21 @@ final class DEXProvider: PriceProvider {
             }
         }
 
-        // Gecko 也查不到（或整体连不上）的币，交给 LI.FI 兜底
+        // Gecko 也查不到（或整体连不上）的币：
+        // BSC 的币先走读链（15 秒一轮，比 LI.FI 快），其它链直接交给 LI.FI
         if attempted > 0 {
             let missed = geckoKeys.subtracting(matched)
             if !missed.isEmpty {
                 for key in missed {
                     geckoKeys.remove(key)
-                    lifiKeys.insert(key)
+                    if isBSC(key) {
+                        rpcKeys.insert(key)
+                    } else {
+                        lifiKeys.insert(key)
+                    }
                 }
-                lastLiFiRefresh = .distantPast   // 下一轮马上补价
+                lastRPCRefresh = .distantPast    // 下一轮马上补价
+                lastLiFiRefresh = .distantPast
             }
         }
 
@@ -419,39 +429,34 @@ final class DEXProvider: PriceProvider {
                 let tick = PriceTick(coinId: coinId, priceUSD: price, change24h: nil, timestamp: now)
                 onTick?(tick)
             }
-            // LI.FI 也查不到的 BSC 币，最后直接读链
-            let missed = lifiKeys.subtracting(matched)
-            if !missed.isEmpty {
-                for key in missed {
-                    lifiKeys.remove(key)
-                    rpcKeys.insert(key)
-                }
-                lastRPCRefresh = .distantPast   // 下一轮马上补价
-            }
             return nil
         } catch is CancellationError {
             return nil
         } catch let err as DexScreenerError {
-            // LI.FI 整体连不上，把所有币交给读链兜底
-            moveAllLiFiToRPC()
             return err
         } catch {
-            moveAllLiFiToRPC()
             return .unknown
         }
     }
 
-    private func moveAllLiFiToRPC() {
-        guard !lifiKeys.isEmpty else { return }
-        for key in lifiKeys {
-            rpcKeys.insert(key)
+    /// 读链也读不到（没有 USDT/WBNB 池、节点全挂），最后一层交给 LI.FI
+    private func moveAllRPCToLiFi() {
+        guard !rpcKeys.isEmpty else { return }
+        for key in rpcKeys {
+            lifiKeys.insert(key)
         }
-        lifiKeys.removeAll()
-        lastRPCRefresh = .distantPast   // 下一轮马上补价
+        rpcKeys.removeAll()
+        lastLiFiRefresh = .distantPast   // 下一轮马上补价
     }
 
-    /// LI.FI 也查不到时的最后一层兜底：BSC 直接读 PancakeSwap V2 的池子储备。
-    /// 每 15 秒最多一轮；ChainRPC 内部有 10 秒缓存和节点轮换。
+    private func isBSC(_ key: String) -> Bool {
+        guard let chain = key.split(separator: ":", maxSplits: 1).first else { return false }
+        return chain.lowercased() == "bsc" || chain == "56"
+    }
+
+    /// BSC 的币在 DexScreener 和 GeckoTerminal 都失败后，先走这一层：
+    /// 直接读 PancakeSwap V2 的池子储备，15 秒一轮。
+    /// 读不到（没有 USDT/WBNB 池、节点全挂）再落到 LI.FI。
     private func refreshRPCIfNeeded() async -> DexScreenerError? {
         guard Date().timeIntervalSince(lastRPCRefresh) >= rpcInterval else { return nil }
         lastRPCRefresh = Date()
@@ -460,6 +465,7 @@ final class DEXProvider: PriceProvider {
         let snapshot = snapshotCoins()
         var items: [(chainId: String, address: String)] = []
         var coinsByID: [String: Coin] = [:]
+        var keyByCoinID: [String: String] = [:]
 
         for coin in snapshot {
             guard case .dex(let chainId, let address) = coin.source else { continue }
@@ -467,23 +473,37 @@ final class DEXProvider: PriceProvider {
             guard rpcKeys.contains(key) else { continue }
             items.append((chainId, address))
             coinsByID[coin.id] = coin
+            keyByCoinID[coin.id] = key
         }
         guard !items.isEmpty else { return nil }
 
         do {
             let prices = try await ChainRPC.prices(items)
             let now = Date()
+            var matched: Set<String> = []
             for (coinId, price) in prices {
                 guard coinsByID[coinId] != nil else { continue }
+                if let key = keyByCoinID[coinId] { matched.insert(key) }
                 let tick = PriceTick(coinId: coinId, priceUSD: price, change24h: nil, timestamp: now)
                 onTick?(tick)
+            }
+            // 读链也读不到的币，交给 LI.FI
+            let missed = rpcKeys.subtracting(matched)
+            if !missed.isEmpty {
+                for key in missed {
+                    rpcKeys.remove(key)
+                    lifiKeys.insert(key)
+                }
+                lastLiFiRefresh = .distantPast
             }
             return nil
         } catch is CancellationError {
             return nil
         } catch let err as DexScreenerError {
+            moveAllRPCToLiFi()
             return err
         } catch {
+            moveAllRPCToLiFi()
             return .unknown
         }
     }

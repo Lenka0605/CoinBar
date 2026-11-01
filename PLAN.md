@@ -25,3 +25,10 @@
 - App 启动时 + 每 6 小时静默检查；菜单里有「检查更新」，有新版显示「立即更新」→ 下载 → 解压 → 校验 bundle id → 替换自身并重启
 - 发版：`scripts/release.sh 1.0.1 "更新说明"`
 - 首次从浏览器下载需要右键「打开」绕过 Gatekeeper（未公证）；之后 App 内自更新不会再弹
+
+## 多源兜底原则（老板 2026-11-01 定）
+能接的数据源都接上，按顺序排，一个用不了自动换下一个。价格、图标都这样。
+- 交易所币价格：Gate WS → Binance vision WS → Gate REST 每 60 秒补价
+- 链上币价格：Ave（需 key，大陆可用）→ DexScreener（~10s）→ GeckoTerminal（~30s）→ LI.FI（大陆可用，~5 分钟缓存）→ BSC 读链（publicnode/drpc/1rpc，大陆可用，规划中）
+- 图标：内置图标 → 磁盘缓存 → `Coin.iconURL` + `Coin.altIconURLs` 依次尝试（Ave iconaves.com 大陆可用 / DexScreener / GeckoTerminal / LI.FI）→ Gate CDN → 首字母占位
+- Ave key 放在 `AppConfig.aveAPIKey`，为空时自动跳过 Ave

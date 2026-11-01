@@ -18,8 +18,17 @@ struct Coin: Codable, Hashable, Identifiable {
     var name: String            // 全名，如 "Bitcoin"
     var source: CoinSource
     var showInMenuBar: Bool = false
-    /// 图标地址（链上币由 DexScreener 提供；交易所币用内置图标，可为空）
+    /// 首选图标地址（各数据源提供；交易所币用内置图标，可为空）
     var iconURL: String? = nil
+    /// 备选图标地址：按顺序尝试，前一个下载失败（如大陆被墙）就用下一个。
+    /// 各数据源把自己拿到的 logo 都放进来，例如 Ave（大陆可用）、DexScreener、GeckoTerminal、LI.FI
+    var altIconURLs: [String]? = nil
+
+    /// 所有图标候选地址（去重、保持顺序）
+    var allIconURLs: [String] {
+        var seen = Set<String>()
+        return ([iconURL].compactMap { $0 } + (altIconURLs ?? [])).filter { !$0.isEmpty && seen.insert($0).inserted }
+    }
 }
 
 /// 一次价格更新

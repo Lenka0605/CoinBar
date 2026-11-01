@@ -1,10 +1,9 @@
 import AppKit
 import Combine
 
-/// 币种图标：
-/// 1. 交易所币：App 内置图标（市值前 500，大陆免网络）→ 磁盘缓存 → 在线拉 Gate 图标 CDN（大陆被墙，海外可用）
-/// 2. 链上币：Coin.iconURL（DexScreener 提供）→ 磁盘缓存
-/// 3. 都没有：按代号首字母生成彩色圆形占位图
+/// 币种图标，多来源依次尝试，一个不行换下一个：
+/// 内置图标（市值前 500，交易所币，大陆免网络）→ 磁盘缓存 → 数据源给的各个 logo 地址（Ave / DexScreener /
+/// GeckoTerminal / LI.FI…，按顺序）→ Gate 图标 CDN（交易所币）→ 首字母彩色圆形占位图
 @MainActor
 final class CoinIcons: ObservableObject {
     static let shared = CoinIcons()
@@ -47,7 +46,8 @@ final class CoinIcons: ObservableObject {
             memory[key] = img
             return sized(img, size)
         }
-        if let remote = remoteURL(coin) { fetch(remote, key: key, to: file) }
+        let remotes = remoteURLs(coin)
+        if !remotes.isEmpty { fetch(remotes, key: key, to: file) }
         return placeholder(coin.symbol, size: size)
     }
 
@@ -55,8 +55,9 @@ final class CoinIcons: ObservableObject {
         coin.id.replacingOccurrences(of: ":", with: "_").replacingOccurrences(of: "/", with: "_")
     }
 
-    private func remoteURL(_ coin: Coin) -> URL? {
-        if let s = coin.iconURL, var c = URLComponents(string: s) {
+    private func remoteURLs(_ coin: Coin) -> [URL] {
+        var list: [URL] = coin.allIconURLs.compactMap { raw in
+            guard var c = URLComponents(string: raw) else { return nil }
             // DexScreener 图片默认 800px，图标只需要 64px
             if c.host?.contains("dexscreener") == true {
                 c.queryItems = [URLQueryItem(name: "width", value: "64"), URLQueryItem(name: "height", value: "64"),
@@ -64,27 +65,36 @@ final class CoinIcons: ObservableObject {
             }
             return c.url
         }
-        if case .cex(let sym) = coin.source {
-            return URL(string: "https://icon.gateimg.com/images/coin_icon/64/\(sym.lowercased()).png")
+        if case .cex(let sym) = coin.source,
+           let gate = URL(string: "https://icon.gateimg.com/images/coin_icon/64/\(sym.lowercased()).png") {
+            list.append(gate)
         }
-        return nil
+        return list
     }
 
-    private func fetch(_ url: URL, key: String, to file: URL) {
+    /// 依次尝试每个地址，拿到第一张有效图片就停
+    private func fetch(_ urls: [URL], key: String, to file: URL) {
         guard !inFlight.contains(key), !failed.contains(key) else { return }
         inFlight.insert(key)
         Task {
-            var req = URLRequest(url: url, timeoutInterval: 10)
-            req.setValue("Mozilla/5.0 CoinBar", forHTTPHeaderField: "User-Agent")
-            let data = try? await URLSession.shared.data(for: req).0
+            var got: (Data, NSImage)?
+            for url in urls {
+                var req = URLRequest(url: url, timeoutInterval: 8)
+                req.setValue("Mozilla/5.0 CoinBar", forHTTPHeaderField: "User-Agent")
+                if let (data, resp) = try? await URLSession.shared.data(for: req),
+                   (resp as? HTTPURLResponse)?.statusCode == 200,
+                   let img = NSImage(data: data), img.isValid {
+                    got = (data, img); break
+                }
+            }
             await MainActor.run {
                 self.inFlight.remove(key)
-                if let data, let img = NSImage(data: data), img.isValid {
+                if let (data, img) = got {
                     try? data.write(to: file)
                     self.memory[key] = img
                     self.version += 1
                 } else {
-                    self.failed.insert(key)   // 本次运行不再重试（大陆网络下避免反复超时）
+                    self.failed.insert(key)   // 全部失败：本次运行不再重试，显示首字母占位
                 }
             }
         }

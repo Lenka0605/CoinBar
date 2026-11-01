@@ -27,6 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
+        MainMenu.install()
         PriceStore.shared.start()
         statusBar = StatusBarController()
         statusBar.openSettings = { [weak self] in self?.showSettings() }

@@ -42,17 +42,46 @@ final class PriceStore: ObservableObject {
         let debug = ProcessInfo.processInfo.environment["COINBAR_DEBUG"] != nil
         let handler: (PriceTick) -> Void = { [weak self] tick in
             if debug { print("tick", tick.coinId, tick.priceUSD, tick.change24h ?? 0) }
-            DispatchQueue.main.async { self?.prices[tick.coinId] = tick }
+            Task { @MainActor in self?.enqueue(tick) }
         }
         cex.onTick = handler
         dex.onTick = handler
-        dex.onError = { [weak self] err in DispatchQueue.main.async { self?.dexError = err } }
+        dex.onError = { [weak self] err in Task { @MainActor in self?.dexError = err } }
         dispatch()
         cex.start()
         dex.start()
     }
 
     func stop() { cex.stop(); dex.stop() }
+
+    // MARK: 节流：行情可能一秒几十条，攒 0.5 秒统一发布一次，避免菜单/窗口频繁重绘
+    private var pending: [String: PriceTick] = [:]
+    private var flushScheduled = false
+
+    private func enqueue(_ tick: PriceTick) {
+        guard contains(tick.coinId) else { return }
+        pending[tick.coinId] = tick
+        guard !flushScheduled else { return }
+        flushScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.flushScheduled = false
+                guard !self.pending.isEmpty else { return }
+                self.prices.merge(self.pending) { _, new in new }
+                self.pending.removeAll()
+            }
+        }
+    }
+
+    /// 超过阈值没更新视为数据陈旧。交易所只在价格变动时推送，冷门币可能很久不动，给 180 秒；
+    /// 链上每轮都会回 tick，但币多时会轮转，给 120 秒
+    func isStale(_ coin: Coin, now: Date = Date()) -> Bool {
+        guard let t = prices[coin.id] else { return true }
+        let limit: TimeInterval
+        if case .dex = coin.source { limit = 120 } else { limit = 180 }
+        return now.timeIntervalSince(t.timestamp) > limit
+    }
 
     // MARK: 编辑关注列表
     func add(_ coin: Coin) {
@@ -70,9 +99,16 @@ final class PriceStore: ObservableObject {
         coins.move(fromOffsets: from, toOffset: to); changed()
     }
 
-    func toggleMenuBar(_ id: String) {
-        guard let i = coins.firstIndex(where: { $0.id == id }) else { return }
+    /// 菜单栏最多显示几个币（再多会把系统图标挤掉）
+    static let maxInMenuBar = 3
+
+    /// 返回 false 表示已达上限、没有勾选成功
+    @discardableResult
+    func toggleMenuBar(_ id: String) -> Bool {
+        guard let i = coins.firstIndex(where: { $0.id == id }) else { return false }
+        if !coins[i].showInMenuBar && coins.filter(\.showInMenuBar).count >= Self.maxInMenuBar { return false }
         coins[i].showInMenuBar.toggle(); changed()
+        return true
     }
 
     func contains(_ id: String) -> Bool { coins.contains { $0.id == id } }

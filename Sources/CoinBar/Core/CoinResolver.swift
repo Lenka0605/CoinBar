@@ -24,15 +24,32 @@ enum CoinResolver {
             let seen = Set(cexList.map(\.id))
             result.candidates += list.filter { !seen.contains($0.id) }
         case .failure(let err):
-            if (err as? DexScreenerError) == .network {
-                result.dexNotice = cexList.isEmpty
-                    ? "连不上链上数据源 DexScreener（中国大陆网络需开代理）。交易所里没找到这个币。"
-                    : "链上数据源 DexScreener 连不上（中国大陆需代理），下面只显示交易所结果。"
-            } else {
-                result.dexNotice = "链上搜索失败：\(err.localizedDescription)"
-            }
+            result.dexNotice = notice(err, cexFound: !cexList.isEmpty)
         }
         return result
+    }
+
+    /// 交易所部分（Gate 本地缓存，通常秒回）
+    static func cex(_ input: String) async -> [CoinCandidate] {
+        let q = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        return await cexSearch(q, isAddress: DEXSearch.looksLikeContractAddress(q))
+    }
+
+    /// 链上部分；返回 (结果, 提示)。大陆无代理时可能要十几秒才失败，界面不要等它
+    static func dex(_ input: String, cexFound: Bool) async -> ([CoinCandidate], String?) {
+        let q = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch await dexSearch(q, isAddress: DEXSearch.looksLikeContractAddress(q)) {
+        case .success(let list): return (list, nil)
+        case .failure(let err): return ([], notice(err, cexFound: cexFound))
+        }
+    }
+
+    private static func notice(_ err: Error, cexFound: Bool) -> String {
+        if (err as? DexScreenerError) == .network {
+            return cexFound ? "链上数据源 DexScreener 连不上（中国大陆需代理），只显示了交易所结果。"
+                            : "交易所里没找到；链上数据源 DexScreener 连不上（中国大陆需开代理）。"
+        }
+        return "链上搜索失败：\(err.localizedDescription)"
     }
 
     private static func cexSearch(_ input: String, isAddress: Bool) async -> [CoinCandidate] {

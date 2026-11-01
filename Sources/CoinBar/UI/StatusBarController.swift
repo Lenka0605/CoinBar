@@ -11,6 +11,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     private var bag = Set<AnyCancellable>()
     private var rowItems: [String: NSMenuItem] = [:]
     private var updateItem = NSMenuItem()
+    private var menuOpen = false
     var openSettings: () -> Void = {}
 
     override init() {
@@ -22,7 +23,8 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         refreshTitle()
 
         store.$prices.receive(on: DispatchQueue.main).sink { [weak self] _ in
-            self?.refreshTitle(); self?.refreshRows()
+            self?.refreshTitle()
+            if self?.menuOpen == true { self?.refreshRows() }   // 菜单没打开就不重建行
         }.store(in: &bag)
         store.$coins.receive(on: DispatchQueue.main).sink { [weak self] _ in
             DispatchQueue.main.async { self?.rebuildMenu(); self?.refreshTitle() }
@@ -51,9 +53,12 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         for (i, coin) in shown.enumerated() {
             if i > 0 { out.append(NSAttributedString(string: "  ", attributes: [.font: font])) }
             let tick = store.prices[coin.id]
+            let stale = store.isStale(coin)
             let price = tick.map { Fmt.price($0.priceUSD) } ?? "--"
-            out.append(NSAttributedString(string: "\(coin.symbol) \(price)", attributes: [.font: font]))
-            if store.showChangeInBar, let ch = tick?.change24h {
+            var attrs: [NSAttributedString.Key: Any] = [.font: font]
+            if stale { attrs[.foregroundColor] = NSColor.tertiaryLabelColor }
+            out.append(NSAttributedString(string: "\(coin.symbol) \(price)", attributes: attrs))
+            if store.showChangeInBar, !stale, let ch = tick?.change24h {
                 out.append(NSAttributedString(string: " \(Fmt.change(ch))",
                     attributes: [.font: small, .foregroundColor: ch >= 0 ? NSColor.systemGreen : NSColor.systemRed]))
             }
@@ -120,11 +125,14 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             if case .dex(let chain, _) = coin.source { tag = DexCandidates.chainDisplayName(chain) } else { tag = "" }
             s.append(NSAttributedString(string: "\t\(String((tag.isEmpty ? coin.name : tag).prefix(12)))",
                                         attributes: [.font: gray, .foregroundColor: NSColor.secondaryLabelColor]))
+            let stale = store.isStale(coin)
             s.append(NSAttributedString(string: "\t$" + (tick.map { Fmt.price($0.priceUSD) } ?? "--"),
-                                        attributes: [.font: font]))
+                attributes: [.font: font, .foregroundColor: stale ? NSColor.tertiaryLabelColor : NSColor.labelColor]))
             let ch = tick?.change24h
-            s.append(NSAttributedString(string: "\t" + Fmt.change(ch), attributes: [.font: font,
-                .foregroundColor: (ch ?? 0) >= 0 ? NSColor.systemGreen : NSColor.systemRed]))
+            let chText = tick == nil ? "连接中" : (stale ? "已断开" : Fmt.change(ch))
+            s.append(NSAttributedString(string: "\t" + chText, attributes: [.font: stale ? gray : font,
+                .foregroundColor: stale ? NSColor.secondaryLabelColor
+                                        : ((ch ?? 0) >= 0 ? NSColor.systemGreen : NSColor.systemRed)]))
             s.addAttribute(.paragraphStyle, value: para, range: NSRange(location: 0, length: s.length))
             mi.attributedTitle = s
             mi.state = coin.showInMenuBar ? .on : .off
@@ -142,8 +150,14 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     // MARK: 动作
+    func menuWillOpen(_ menu: NSMenu) { menuOpen = true; refreshRows() }
+    func menuDidClose(_ menu: NSMenu) { menuOpen = false }
+
     @objc private func toggleCoin(_ sender: NSMenuItem) {
-        if let id = sender.representedObject as? String { store.toggleMenuBar(id) }
+        guard let id = sender.representedObject as? String else { return }
+        if !store.toggleMenuBar(id) {
+            alert("菜单栏最多显示 \(PriceStore.maxInMenuBar) 个币", "先取消勾选一个，再勾选新的。")
+        }
     }
     @objc private func showSettings() { openSettings() }
     @objc private func quit() { NSApp.terminate(nil) }

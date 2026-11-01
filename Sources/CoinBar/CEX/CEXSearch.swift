@@ -14,20 +14,22 @@ enum CEXSearch {
     }
 
     // 可注入独立缓存，方便验证网络错误、缓存过期和地址匹配，不污染用户缓存。
-    static func lookup(symbol input: String, catalog: GateCatalog) async -> CoinCandidate? {
+    static func lookup(symbol input: String, catalog: GateCatalog,
+                       tickers: GateTickerCache = .shared) async -> CoinCandidate? {
         guard !Task.isCancelled, let symbol = CEXSymbol.normalize(input),
               let snapshot = await catalog.snapshot(), !Task.isCancelled,
-              let row = snapshot.tradableCurrencies.first(where: { $0.currency.uppercased() == symbol }) else { return nil }
-        return candidate(row)
+              let row = snapshot.tradableCurrencies.first(where: { $0.currency.uppercased() == symbol && isAllowed($0) }) else { return nil }
+        return await priced([candidate(row)], using: tickers).first
     }
 
-    static func lookup(address input: String, catalog: GateCatalog) async -> [CoinCandidate] {
+    static func lookup(address input: String, catalog: GateCatalog,
+                       tickers: GateTickerCache = .shared) async -> [CoinCandidate] {
         let address = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !address.isEmpty, !Task.isCancelled,
               let snapshot = await catalog.snapshot(), !Task.isCancelled else { return [] }
         let evm = isEVMAddress(address)
         var results: [CoinCandidate] = []
-        for row in snapshot.tradableCurrencies {
+        for row in snapshot.tradableCurrencies where isAllowed(row) {
             let matches = (row.chains ?? []).filter { chain in
                 guard let raw = chain.addr else { return false }
                 let contract = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -39,26 +41,46 @@ enum CEXSearch {
                 results.append(candidate(row, matchedChains: chains))
             }
         }
-        return sortedUnique(results)
+        return await priced(sortedUnique(results), using: tickers)
     }
 
-    static func search(query input: String, catalog: GateCatalog) async -> [CoinCandidate] {
+    static func search(query input: String, catalog: GateCatalog,
+                       tickers: GateTickerCache = .shared) async -> [CoinCandidate] {
         let query = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty, !Task.isCancelled,
               let snapshot = await catalog.snapshot(), !Task.isCancelled else { return [] }
         let normalized = CEXSymbol.normalize(query) ?? query.uppercased()
         let rows = snapshot.tradableCurrencies.filter {
-            $0.currency.localizedCaseInsensitiveContains(normalized)
-                || ($0.name?.localizedCaseInsensitiveContains(query) ?? false)
+            isAllowed($0) && ($0.currency.localizedCaseInsensitiveContains(normalized)
+                || ($0.name?.localizedCaseInsensitiveContains(query) ?? false))
         }.sorted {
             let left = rank($0, query: query, symbol: normalized)
             let right = rank($1, query: query, symbol: normalized)
             return left == right ? $0.currency < $1.currency : left < right
         }
         var seen: Set<String> = []
-        return rows.compactMap { row in
+        let results = rows.compactMap { row -> CoinCandidate? in
             let result = candidate(row)
             return seen.insert(result.id).inserted ? result : nil
+        }
+        return await priced(results, using: tickers)
+    }
+
+    private static func isAllowed(_ row: GateCurrency) -> Bool {
+        let symbol = row.currency.uppercased()
+        // 部分 5L/5S 产品的链仍填 ETH，后缀与虚拟链任一命中都排除。
+        return !["3L", "3S", "5L", "5S"].contains(where: symbol.hasSuffix)
+            && row.chain?.uppercased() != "ITSNOTACHAIN"
+            && !(row.chains ?? []).contains { $0.name?.uppercased() == "ITSNOTACHAIN" }
+    }
+
+    private static func priced(_ candidates: [CoinCandidate], using tickers: GateTickerCache) async -> [CoinCandidate] {
+        guard !candidates.isEmpty, !Task.isCancelled else { return [] }
+        let prices = await tickers.prices()
+        guard !Task.isCancelled else { return [] }
+        return candidates.map {
+            CoinCandidate(coin: $0.coin, priceUSD: prices[$0.coin.symbol], liquidityUSD: $0.liquidityUSD,
+                          detail: $0.detail)
         }
     }
 
@@ -97,4 +119,64 @@ enum CEXSearch {
         var seen: Set<String> = []
         return candidates.sorted { $0.coin.symbol < $1.coin.symbol }.filter { seen.insert($0.id).inserted }
     }
+}
+
+/// 搜索用的轻量快照：一次拉全量行情，短时间内的并发搜索共用请求。
+/// 行情只放内存并保留 5 秒；失败时保留候选、留空价格，不把旧价冒充当前价。
+actor GateTickerCache {
+    static let shared = GateTickerCache()
+    private let session: URLSession
+    private let now: () -> Date
+    private let ttl: TimeInterval
+    private var cached: [String: Double] = [:]
+    private var fetchedAt: Date = .distantPast
+    private var retryAfter: Date = .distantPast
+    private var inFlight: Task<[String: Double], Error>?
+
+    init(session: URLSession = .shared, ttl: TimeInterval = 5, now: @escaping () -> Date = Date.init) {
+        self.session = session
+        self.ttl = ttl
+        self.now = now
+    }
+
+    func prices() async -> [String: Double] {
+        let date = now()
+        if date >= fetchedAt, date.timeIntervalSince(fetchedAt) < ttl { return cached }
+        if let inFlight { return (try? await inFlight.value) ?? [:] }
+        guard date >= retryAfter else { return [:] }
+        let session = self.session
+        let work = Task { try await Self.fetch(session: session) }
+        inFlight = work
+        do {
+            let result = try await work.value
+            cached = result
+            fetchedAt = now()
+            retryAfter = .distantPast
+            inFlight = nil
+            return result
+        } catch {
+            inFlight = nil
+            retryAfter = now().addingTimeInterval(3)
+            return [:]
+        }
+    }
+
+    private static func fetch(session: URLSession) async throws -> [String: Double] {
+        let url = URL(string: "https://api.gateio.ws/api/v4/spot/tickers")!
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 3)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (data, response) = try await session.data(for: request)
+        guard let response = response as? HTTPURLResponse, response.statusCode == 200,
+              let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { throw TickerError.invalid }
+        var prices: [String: Double] = [:]
+        for row in rows {
+            guard let pair = row["currency_pair"] as? String, pair.hasSuffix("_USDT"),
+                  let price = CEXWire.number(row["last"]), price > 0 else { continue }
+            let symbol = String(pair.dropLast(5))
+            if !symbol.isEmpty { prices[symbol] = price }
+        }
+        return prices
+    }
+
+    private enum TickerError: Error { case invalid }
 }

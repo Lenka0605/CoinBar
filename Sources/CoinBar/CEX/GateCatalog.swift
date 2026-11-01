@@ -5,6 +5,7 @@ struct GateCurrency: Codable {
     let name: String?
     let delisted: Bool?
     let trade_disabled: Bool?
+    let chain: String?
     let chains: [Chain]?
 
     struct Chain: Codable {

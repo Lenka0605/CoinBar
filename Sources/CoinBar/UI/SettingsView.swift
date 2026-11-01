@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import ServiceManagement
 
 struct SettingsView: View {
@@ -7,6 +8,9 @@ struct SettingsView: View {
     @State private var searching = false
     @State private var result = CoinResolver.Result()
     @State private var searched = false
+    @State private var dexLoading = false
+    @State private var searchSeq = 0
+    @State private var limitHint = false
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     var body: some View {
@@ -28,6 +32,10 @@ struct SettingsView: View {
         }
         .padding(18)
         .frame(width: 520, height: 600)
+        // 窗口是复用的：每次重新成为前台窗口时，同步一下系统里的开机启动状态
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+        }
     }
 
     // MARK: 添加
@@ -40,7 +48,6 @@ struct SettingsView: View {
                     .onSubmit(search)
                 Button(searching ? "搜索中…" : "搜索", action: search)
                     .disabled(searching || query.trimmingCharacters(in: .whitespaces).isEmpty)
-                    .keyboardShortcut(.defaultAction)
             }
             Text("合约地址会自动识别所在链；交易所上市的币走实时推送（约 1 秒），纯链上币约 10 秒刷新。")
                 .font(.caption).foregroundStyle(.secondary)
@@ -49,7 +56,13 @@ struct SettingsView: View {
                 Label(notice, systemImage: "exclamationmark.triangle")
                     .font(.caption).foregroundStyle(.orange)
             }
-            if searched && !searching && result.candidates.isEmpty && result.dexNotice == nil {
+            if dexLoading {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("正在搜索链上 DEX…").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            if searched && !searching && !dexLoading && result.candidates.isEmpty && result.dexNotice == nil {
                 Text("没有找到匹配的币").font(.caption).foregroundStyle(.secondary)
             }
             if !result.candidates.isEmpty {
@@ -91,13 +104,27 @@ struct SettingsView: View {
         .padding(.vertical, 2)
     }
 
+    /// 先出交易所结果（本地缓存，秒回），链上结果回来再追加；序号用来丢弃过期的搜索
     private func search() {
         let q = query
-        guard !q.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        guard !q.trimmingCharacters(in: .whitespaces).isEmpty, !searching else { return }
+        searchSeq += 1
+        let seq = searchSeq
         searching = true
-        Task {
-            let r = await CoinResolver.resolve(q)
-            await MainActor.run { result = r; searching = false; searched = true }
+        dexLoading = true
+        result = CoinResolver.Result()
+        Task { @MainActor in
+            let cexList = await CoinResolver.cex(q)
+            guard seq == searchSeq else { return }
+            result.candidates = cexList
+            searching = false
+            searched = true
+            let (dexList, notice) = await CoinResolver.dex(q, cexFound: !cexList.isEmpty)
+            guard seq == searchSeq else { return }
+            let seen = Set(result.candidates.map(\.id))
+            result.candidates += dexList.filter { !seen.contains($0.id) }
+            result.dexNotice = notice
+            dexLoading = false
         }
     }
 
@@ -107,31 +134,39 @@ struct SettingsView: View {
             HStack {
                 Text("我的币种").font(.headline)
                 Spacer()
-                Text("勾选的显示在菜单栏，可拖动排序").font(.caption).foregroundStyle(.secondary)
+                Text(limitHint ? "菜单栏最多显示 \(PriceStore.maxInMenuBar) 个，先取消一个" : "勾选的显示在菜单栏（最多 \(PriceStore.maxInMenuBar) 个），可拖动排序")
+                    .font(.caption).foregroundStyle(limitHint ? .orange : .secondary)
             }
             List {
-                ForEach(store.coins) { coin in
-                    HStack {
-                        Toggle("", isOn: Binding(get: { coin.showInMenuBar },
-                                                 set: { _ in store.toggleMenuBar(coin.id) }))
-                            .labelsHidden()
-                        Text(coin.symbol).fontWeight(.semibold).frame(width: 64, alignment: .leading)
-                        Text(sourceText(coin)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                        Spacer()
-                        if let t = store.prices[coin.id] {
-                            Text("$" + Fmt.price(t.priceUSD)).monospacedDigit()
-                            Text(Fmt.change(t.change24h)).monospacedDigit().frame(width: 64, alignment: .trailing)
-                                .foregroundStyle((t.change24h ?? 0) >= 0 ? .green : .red)
-                        } else {
-                            Text("连接中…").foregroundStyle(.secondary)
-                        }
-                        Button { store.remove(coin.id) } label: { Image(systemName: "trash") }
-                            .buttonStyle(.borderless)
-                    }
-                }
+                ForEach(store.coins) { coin in coinRow(coin) }
                 .onMove { store.move(from: $0, to: $1) }
             }
             .listStyle(.bordered(alternatesRowBackgrounds: true))
+        }
+    }
+
+    private func coinRow(_ coin: Coin) -> some View {
+        let tick = store.prices[coin.id]
+        let stale = store.isStale(coin)
+        let up = (tick?.change24h ?? 0) >= 0
+        let changeColor: Color = stale ? .secondary : (up ? .green : .red)
+        return HStack {
+            Toggle("", isOn: Binding(get: { coin.showInMenuBar },
+                                     set: { _ in limitHint = !store.toggleMenuBar(coin.id) }))
+                .labelsHidden()
+            Text(coin.symbol).fontWeight(.semibold).frame(width: 64, alignment: .leading)
+            Text(sourceText(coin)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            Spacer()
+            Text(tick.map { "$" + Fmt.price($0.priceUSD) } ?? "")
+                .monospacedDigit()
+                .foregroundStyle(stale ? Color.secondary : Color.primary)
+                .frame(width: 100, alignment: .trailing)
+            Text(tick == nil ? "连接中…" : (stale ? "已断开" : Fmt.change(tick?.change24h)))
+                .monospacedDigit()
+                .foregroundStyle(tick == nil ? Color.secondary : changeColor)
+                .frame(width: 64, alignment: .trailing)
+            Button { store.remove(coin.id) } label: { Image(systemName: "trash") }
+                .buttonStyle(.borderless)
         }
     }
 

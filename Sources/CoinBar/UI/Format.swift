@@ -1,20 +1,42 @@
 import Foundation
 
 enum Fmt {
-    /// 价格：≥1000 不带小数加千分位；≥1 两位小数；<1 保留 4 位有效数字
+    private static let subscripts: [Character] = ["₀","₁","₂","₃","₄","₅","₆","₇","₈","₉"]
+
+    /// 价格显示：
+    /// ≥1000 → 77,958 ；1~1000 → 95.24 ；0.01~1 → 0.07575（4 位有效数字，去尾零）
+    /// 0.0001~0.01 → 0.002345（4 位有效数字）；更小 → 0.0₅2938（下标表示小数点后连续 0 的个数）
     static func price(_ v: Double) -> String {
+        let a = abs(v)
+        if a == 0 { return "0" }
+        if a >= 1000 { return decimal(v, maxFrac: 0) }
+        if a >= 1 { return decimal(v, minFrac: 2, maxFrac: 2) }
+        if a >= 0.01 {                                  // 4 位有效数字，去尾零：0.07575、0.5
+            let f = NumberFormatter()
+            f.locale = Locale(identifier: "en_US")
+            f.usesSignificantDigits = true
+            f.maximumSignificantDigits = 4
+            return f.string(from: NSNumber(value: v)) ?? "\(v)"
+        }
+        // 小数点后连续 0 的个数
+        var zeros = Int(ceil(-log10(a))) - 1
+        var sig = Int((a * pow(10, Double(zeros + 4))).rounded())     // 4 位有效数字
+        if sig >= 10000 { zeros -= 1; sig = Int((a * pow(10, Double(zeros + 4))).rounded()) }
+        if sig < 1000 { zeros += 1; sig = Int((a * pow(10, Double(zeros + 4))).rounded()) }
+        var digits = String(sig)
+        while digits.count > 1 && digits.hasSuffix("0") { digits.removeLast() }
+        let sign = v < 0 ? "-" : ""
+        if zeros < 4 { return sign + "0." + String(repeating: "0", count: zeros) + digits }
+        let sub = String(String(zeros).map { subscripts[Int(String($0))!] })
+        return sign + "0.0" + sub + digits
+    }
+
+    private static func decimal(_ v: Double, minFrac: Int = 0, maxFrac: Int) -> String {
         let f = NumberFormatter()
         f.numberStyle = .decimal
         f.locale = Locale(identifier: "en_US")
-        switch abs(v) {
-        case 1000...: f.maximumFractionDigits = 0
-        case 1..<1000: f.minimumFractionDigits = 2; f.maximumFractionDigits = 2
-        case 0: return "0"
-        default:
-            f.usesSignificantDigits = true
-            f.maximumSignificantDigits = 4
-            f.minimumSignificantDigits = 4
-        }
+        f.minimumFractionDigits = minFrac
+        f.maximumFractionDigits = maxFrac
         return f.string(from: NSNumber(value: v)) ?? "\(v)"
     }
 

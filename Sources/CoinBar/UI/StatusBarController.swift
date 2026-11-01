@@ -13,6 +13,10 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     private var updateItem = NSMenuItem()
     private var menuOpen = false
     private var styleItems: [(NSMenuItem, () -> Bool)] = []
+    // 轮播
+    private var rotateTimer: Timer?
+    private var rotateCurrent: String?
+    private var rotateQueue: [String] = []
     var openSettings: () -> Void = {}
 
     override init() {
@@ -33,6 +37,10 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         store.$dexError.receive(on: DispatchQueue.main).sink { [weak self] _ in
             DispatchQueue.main.async { self?.rebuildMenu() }
         }.store(in: &bag)
+        Publishers.CombineLatest3(store.$rotateSeconds, store.$rotateRandom, store.$rotateCheckedOnly)
+            .receive(on: DispatchQueue.main).sink { [weak self] _ in
+                DispatchQueue.main.async { self?.restartRotation(); self?.refreshStyleItems() }
+            }.store(in: &bag)
         Publishers.Merge3(store.$showChangeInBar, store.$showIconInBar, store.$showSymbolInBar)
             .receive(on: DispatchQueue.main).sink { [weak self] _ in
                 DispatchQueue.main.async { self?.refreshTitle(); self?.refreshStyleItems() }
@@ -48,7 +56,14 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     // MARK: 菜单栏标题
     private func refreshTitle() {
         guard let button = item.button else { return }
-        let shown = store.coins.filter(\.showInMenuBar)
+        let shown: [Coin]
+        if store.rotateSeconds > 0 {
+            let pool = rotationPool()
+            let cur = pool.first { $0.id == rotateCurrent } ?? pool.first
+            shown = cur.map { [$0] } ?? []
+        } else {
+            shown = Array(store.coins.filter(\.showInMenuBar).prefix(PriceStore.maxInMenuBar))
+        }
         let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize - 1, weight: .medium)
         let small = NSFont.monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
         let out = NSMutableAttributedString()
@@ -66,7 +81,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             }
             let tick = store.prices[coin.id]
             let stale = store.isStale(coin)
-            let price = tick.map { Fmt.price($0.priceUSD) } ?? "--"
+            let price = tick.map { "$" + Fmt.price($0.priceUSD) } ?? "--"
             var attrs: [NSAttributedString.Key: Any] = [.font: font]
             if stale { attrs[.foregroundColor] = NSColor.tertiaryLabelColor }
             out.append(NSAttributedString(string: store.showSymbolInBar ? "\(coin.symbol) \(price)" : price,
@@ -113,6 +128,28 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         ] as [(String, Selector, () -> Bool)] {
             let mi = NSMenuItem(title: title, action: sel, keyEquivalent: "")
             mi.target = self
+            styleMenu.addItem(mi)
+            styleItems.append((mi, get))
+        }
+        styleMenu.addItem(.separator())
+        let rotTitle = NSMenuItem(title: "轮播", action: nil, keyEquivalent: ""); rotTitle.isEnabled = false
+        styleMenu.addItem(rotTitle)
+        let rotOptions: [(String, Int)] = [("不轮播（显示勾选的币）", 0)] + PriceStore.rotateOptions.map { ("每 \($0) 秒换一个", $0) }
+        for (title, sec) in rotOptions {
+            let mi = NSMenuItem(title: title, action: #selector(setRotate(_:)), keyEquivalent: "")
+            mi.target = self; mi.tag = sec; mi.indentationLevel = 1
+            styleMenu.addItem(mi)
+            styleItems.append((mi, { [unowned self] in self.store.rotateSeconds == sec }))
+        }
+        styleMenu.addItem(.separator())
+        for (title, sel, get) in [
+            ("按列表顺序", #selector(rotateSequential), { [unowned self] in !self.store.rotateRandom }),
+            ("随机顺序", #selector(rotateRandomOrder), { [unowned self] in self.store.rotateRandom }),
+            ("轮播全部币种", #selector(rotateAll), { [unowned self] in !self.store.rotateCheckedOnly }),
+            ("只轮播勾选的币", #selector(rotateChecked), { [unowned self] in self.store.rotateCheckedOnly }),
+        ] as [(String, Selector, () -> Bool)] {
+            let mi = NSMenuItem(title: title, action: sel, keyEquivalent: "")
+            mi.target = self; mi.indentationLevel = 1
             styleMenu.addItem(mi)
             styleItems.append((mi, get))
         }
@@ -187,6 +224,51 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     @objc private func toggleIcon() { store.showIconInBar.toggle() }
     @objc private func toggleSymbol() { store.showSymbolInBar.toggle() }
     @objc private func toggleChange() { store.showChangeInBar.toggle() }
+    @objc private func setRotate(_ sender: NSMenuItem) { store.rotateSeconds = sender.tag }
+    @objc private func rotateSequential() { store.rotateRandom = false }
+    @objc private func rotateRandomOrder() { store.rotateRandom = true }
+    @objc private func rotateAll() { store.rotateCheckedOnly = false }
+    @objc private func rotateChecked() { store.rotateCheckedOnly = true }
+
+    // MARK: 轮播
+    /// 参与轮播的币：全部，或只勾选的（一个都没勾就退回全部）
+    private func rotationPool() -> [Coin] {
+        if store.rotateCheckedOnly {
+            let checked = store.coins.filter(\.showInMenuBar)
+            if !checked.isEmpty { return checked }
+        }
+        return store.coins
+    }
+
+    private func restartRotation() {
+        rotateTimer?.invalidate(); rotateTimer = nil
+        rotateQueue = []
+        refreshTitle()
+        guard store.rotateSeconds > 0 else { return }
+        let t = Timer(timeInterval: TimeInterval(store.rotateSeconds), repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.advanceRotation() }
+        }
+        RunLoop.main.add(t, forMode: .common)   // 菜单展开时也继续轮播
+        rotateTimer = t
+    }
+
+    private func advanceRotation() {
+        let pool = rotationPool().map(\.id)
+        guard pool.count > 1 else { rotateCurrent = pool.first; refreshTitle(); return }
+        if store.rotateRandom {
+            // 洗牌一轮放完再洗下一轮，保证每个币都轮到；新一轮第一个不与刚显示的重复
+            rotateQueue.removeAll { !pool.contains($0) }
+            if rotateQueue.isEmpty {
+                rotateQueue = pool.shuffled()
+                if rotateQueue.first == rotateCurrent { rotateQueue.append(rotateQueue.removeFirst()) }
+            }
+            rotateCurrent = rotateQueue.removeFirst()
+        } else {
+            let i = rotateCurrent.flatMap { pool.firstIndex(of: $0) } ?? -1
+            rotateCurrent = pool[(i + 1) % pool.count]
+        }
+        refreshTitle()
+    }
 
     func menuWillOpen(_ menu: NSMenu) { menuOpen = true; refreshRows() }
     func menuDidClose(_ menu: NSMenu) { menuOpen = false }

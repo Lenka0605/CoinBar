@@ -113,7 +113,8 @@ final class CoinIcons: ObservableObject {
                 if let r = await Self.download(url) { got = r; break }
             }
             // 公开图标库都没有：后台打开 Ave 网页读图标地址（链上币才做，每个币成功一次后走磁盘缓存）
-            if got == nil, case .dex(let chain, let address) = coin.source {
+            if got == nil, case .dex(let chain, let address) = coin.source,
+               await MainActor.run(body: { PriceStore.shared.aveWebIcons }) {
                 let found: URL? = await withCheckedContinuation { cont in
                     Task { @MainActor in AveWebIcon.shared.lookup(chain: chain, address: address) { cont.resume(returning: $0) } }
                 }

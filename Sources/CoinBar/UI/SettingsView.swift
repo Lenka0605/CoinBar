@@ -33,9 +33,28 @@ struct SettingsView: View {
                     }
             }
             .font(.callout)
+            HStack(spacing: 10) {
+                Text("菜单栏轮播：")
+                Picker("", selection: $store.rotateSeconds) {
+                    Text("不轮播").tag(0)
+                    ForEach(PriceStore.rotateOptions, id: \.self) { Text("每 \($0) 秒").tag($0) }
+                }.labelsHidden().frame(width: 100)
+                Picker("", selection: $store.rotateRandom) {
+                    Text("按顺序").tag(false)
+                    Text("随机").tag(true)
+                }.labelsHidden().frame(width: 90).disabled(store.rotateSeconds == 0)
+                Picker("", selection: $store.rotateCheckedOnly) {
+                    Text("全部币种").tag(false)
+                    Text("只轮播勾选的").tag(true)
+                }.labelsHidden().frame(width: 120).disabled(store.rotateSeconds == 0)
+                Spacer()
+            }
+            .font(.callout)
+            Toggle("找不到图标时，从 Ave 网页获取（中国大陆需代理）", isOn: $store.aveWebIcons)
+                .font(.callout)
         }
         .padding(18)
-        .frame(width: 520, height: 600)
+        .frame(width: 560, height: 680)
         // 窗口是复用的：每次重新成为前台窗口时，同步一下系统里的开机启动状态
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
             launchAtLogin = SMAppService.mainApp.status == .enabled
@@ -139,7 +158,9 @@ struct SettingsView: View {
             HStack {
                 Text("我的币种").font(.headline)
                 Spacer()
-                Text(limitHint ? "菜单栏最多显示 \(PriceStore.maxInMenuBar) 个，先取消一个" : "勾选的显示在菜单栏（最多 \(PriceStore.maxInMenuBar) 个），可拖动排序")
+                Text(limitHint ? "菜单栏最多显示 \(PriceStore.maxInMenuBar) 个，先取消一个"
+                     : (store.rotateSeconds > 0 ? "轮播中：勾选的币参与「只轮播勾选的」，可拖动排序"
+                                                : "勾选的显示在菜单栏（最多 \(PriceStore.maxInMenuBar) 个），可拖动排序"))
                     .font(.caption).foregroundStyle(limitHint ? .orange : .secondary)
             }
             List {

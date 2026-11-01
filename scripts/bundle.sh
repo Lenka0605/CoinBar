@@ -11,7 +11,8 @@ BIN="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/CoinBa
 APP="dist/CoinBar.app"
 rm -rf dist && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/CoinBar"
-[ -f Resources/AppIcon.icns ] && cp Resources/AppIcon.icns "$APP/Contents/Resources/"
+cp Resources/AppIcon.icns "$APP/Contents/Resources/"
+cp -R Resources/CoinIcons "$APP/Contents/Resources/CoinIcons"   # 内置币种图标（大陆连不上图标 CDN）
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

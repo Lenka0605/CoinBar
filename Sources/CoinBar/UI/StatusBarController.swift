@@ -35,6 +35,9 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         store.$showChangeInBar.receive(on: DispatchQueue.main).sink { [weak self] _ in
             DispatchQueue.main.async { self?.refreshTitle() }
         }.store(in: &bag)
+        CoinIcons.shared.$version.receive(on: DispatchQueue.main).sink { [weak self] _ in
+            DispatchQueue.main.async { self?.refreshTitle(); self?.refreshRows() }
+        }.store(in: &bag)
         updater.$state.receive(on: DispatchQueue.main).sink { [weak self] _ in
             DispatchQueue.main.async { self?.refreshUpdateItem() }
         }.store(in: &bag)
@@ -51,7 +54,12 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             out.append(NSAttributedString(string: "₿", attributes: [.font: font]))
         }
         for (i, coin) in shown.enumerated() {
-            if i > 0 { out.append(NSAttributedString(string: "  ", attributes: [.font: font])) }
+            if i > 0 { out.append(NSAttributedString(string: "   ", attributes: [.font: font])) }
+            let att = NSTextAttachment()
+            att.image = CoinIcons.shared.image(for: coin, size: 14)
+            att.bounds = CGRect(x: 0, y: -2.5, width: 14, height: 14)
+            out.append(NSAttributedString(attachment: att))
+            out.append(NSAttributedString(string: " ", attributes: [.font: font]))
             let tick = store.prices[coin.id]
             let stale = store.isStale(coin)
             let price = tick.map { Fmt.price($0.priceUSD) } ?? "--"
@@ -135,6 +143,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
                                         : ((ch ?? 0) >= 0 ? NSColor.systemGreen : NSColor.systemRed)]))
             s.addAttribute(.paragraphStyle, value: para, range: NSRange(location: 0, length: s.length))
             mi.attributedTitle = s
+            mi.image = CoinIcons.shared.image(for: coin, size: 18)
             mi.state = coin.showInMenuBar ? .on : .off
         }
     }

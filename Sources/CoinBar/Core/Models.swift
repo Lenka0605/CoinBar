@@ -18,6 +18,8 @@ struct Coin: Codable, Hashable, Identifiable {
     var name: String            // 全名，如 "Bitcoin"
     var source: CoinSource
     var showInMenuBar: Bool = false
+    /// 图标地址（链上币由 DexScreener 提供；交易所币用内置图标，可为空）
+    var iconURL: String? = nil
 }
 
 /// 一次价格更新

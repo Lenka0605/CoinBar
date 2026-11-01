@@ -4,6 +4,7 @@ import ServiceManagement
 
 struct SettingsView: View {
     @ObservedObject var store = PriceStore.shared
+    @ObservedObject var icons = CoinIcons.shared
     @State private var query = ""
     @State private var searching = false
     @State private var result = CoinResolver.Result()
@@ -75,6 +76,7 @@ struct SettingsView: View {
 
     private func candidateRow(_ c: CoinCandidate) -> some View {
         HStack {
+            Image(nsImage: icons.image(for: c.coin, size: 24)).id(icons.version)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(c.coin.symbol).fontWeight(.semibold)
@@ -154,6 +156,7 @@ struct SettingsView: View {
             Toggle("", isOn: Binding(get: { coin.showInMenuBar },
                                      set: { _ in limitHint = !store.toggleMenuBar(coin.id) }))
                 .labelsHidden()
+            Image(nsImage: icons.image(for: coin, size: 20)).id(icons.version)
             Text(coin.symbol).fontWeight(.semibold).frame(width: 64, alignment: .leading)
             Text(sourceText(coin)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             Spacer()

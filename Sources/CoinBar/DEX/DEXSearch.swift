@@ -50,6 +50,18 @@ enum DEXSearch {
             if lastError == nil { lastError = .unknown }
         }
 
+        // 4. BSC 链上读价（最后一层，只支持 0x 地址）
+        do {
+            let candidates = try await ChainRPC.resolve(address: addr)
+            if !candidates.isEmpty { return withIconFallbacks(candidates) }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let err as DexScreenerError {
+            if lastError == nil { lastError = err }
+        } catch {
+            if lastError == nil { lastError = .unknown }
+        }
+
         if let lastError { throw lastError }
         return []
     }

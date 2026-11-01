@@ -27,6 +27,8 @@ final class DEXProvider: PriceProvider {
     private let geckoInterval: TimeInterval = 30
     /// LI.FI 刷新间隔（接口有约 5 分钟缓存，60 秒调一次不浪费额度）
     private let lifiInterval: TimeInterval = 60
+    /// BSC 读链的刷新间隔（RPC 节点宽松，比 LI.FI 快）
+    private let rpcInterval: TimeInterval = 15
     /// 每隔一段时间重新给 DexScreener 一次机会，防止它后来收录了
     private let dexRetryInterval: TimeInterval = 900
 
@@ -34,8 +36,11 @@ final class DEXProvider: PriceProvider {
     private var geckoKeys: Set<String> = []
     /// GeckoTerminal 也查不到的币，改走 LI.FI
     private var lifiKeys: Set<String> = []
+    /// LI.FI 也没有的 BSC 币，最后直接读链
+    private var rpcKeys: Set<String> = []
     private var lastGeckoRefresh = Date.distantPast
     private var lastLiFiRefresh = Date.distantPast
+    private var lastRPCRefresh = Date.distantPast
     private var lastDexRetry = Date()
 
     private let lock = NSLock()
@@ -128,13 +133,21 @@ final class DEXProvider: PriceProvider {
             if Task.isCancelled { return }
             let lifiError = await refreshLiFiIfNeeded()
             if Task.isCancelled { return }
+            let rpcError = await refreshRPCIfNeeded()
+            if Task.isCancelled { return }
 
             if !lifiKeys.isEmpty, lifiError == nil {
-                // LI.FI 正在给兜底币供价，前两层的网络错误就不算整体故障
+                // LI.FI 正在给兜底币供价，前几层的网络错误就不算整体故障
                 error = nil
             } else {
                 if error == nil { error = geckoError }
                 if error == nil { error = lifiError }
+            }
+            if !rpcKeys.isEmpty, rpcError == nil {
+                // 读链兜底正常供价
+                error = nil
+            } else if error == nil {
+                error = rpcError
             }
             reportStatus(error)
 
@@ -166,6 +179,7 @@ final class DEXProvider: PriceProvider {
             lastDexRetry = Date()
             geckoKeys.removeAll()
             lifiKeys.removeAll()
+            rpcKeys.removeAll()
         }
 
         let snapshot = snapshotCoins()
@@ -210,9 +224,9 @@ final class DEXProvider: PriceProvider {
         for (i, address) in batch.enumerated() {
             if Task.isCancelled { return nil }
 
-            // 这个地址的币都已经交给 GeckoTerminal / LI.FI 了，就别再浪费 DexScreener 的额度
+            // 这个地址的币都已经交给兜底源了，就别再浪费 DexScreener 的额度
             let keys = addressKeys[address] ?? []
-            if !keys.isEmpty, keys.allSatisfy({ geckoKeys.contains($0) || lifiKeys.contains($0) }) {
+            if !keys.isEmpty, keys.allSatisfy({ geckoKeys.contains($0) || lifiKeys.contains($0) || rpcKeys.contains($0) }) {
                 continue
             }
 
@@ -251,7 +265,9 @@ final class DEXProvider: PriceProvider {
         if addedGeckoKey { lastGeckoRefresh = .distantPast }
 
         // 所有币都已经交给兜底源时，DexScreener 失败就不算整体故障
-        let allOnFallback = wanted.keys.allSatisfy { geckoKeys.contains($0) || lifiKeys.contains($0) }
+        let allOnFallback = wanted.keys.allSatisfy {
+            geckoKeys.contains($0) || lifiKeys.contains($0) || rpcKeys.contains($0)
+        }
         // 只有整轮全军覆没才当作数据源故障，部分失败是单个币的问题
         guard attempted > 0, failed == attempted, !allOnFallback else { return nil }
         return lastError ?? .unknown
@@ -381,6 +397,7 @@ final class DEXProvider: PriceProvider {
         let snapshot = snapshotCoins()
         var items: [(chainId: String, address: String)] = []
         var coinsByID: [String: Coin] = [:]
+        var keyByCoinID: [String: String] = [:]
 
         for coin in snapshot {
             guard case .dex(let chainId, let address) = coin.source else { continue }
@@ -388,11 +405,73 @@ final class DEXProvider: PriceProvider {
             guard lifiKeys.contains(key) else { continue }
             items.append((chainId, address))
             coinsByID[coin.id] = coin
+            keyByCoinID[coin.id] = key
         }
         guard !items.isEmpty else { return nil }
 
         do {
             let prices = try await LiFiAPI.prices(items)
+            let now = Date()
+            var matched: Set<String> = []
+            for (coinId, price) in prices {
+                guard coinsByID[coinId] != nil else { continue }
+                if let key = keyByCoinID[coinId] { matched.insert(key) }
+                let tick = PriceTick(coinId: coinId, priceUSD: price, change24h: nil, timestamp: now)
+                onTick?(tick)
+            }
+            // LI.FI 也查不到的 BSC 币，最后直接读链
+            let missed = lifiKeys.subtracting(matched)
+            if !missed.isEmpty {
+                for key in missed {
+                    lifiKeys.remove(key)
+                    rpcKeys.insert(key)
+                }
+                lastRPCRefresh = .distantPast   // 下一轮马上补价
+            }
+            return nil
+        } catch is CancellationError {
+            return nil
+        } catch let err as DexScreenerError {
+            // LI.FI 整体连不上，把所有币交给读链兜底
+            moveAllLiFiToRPC()
+            return err
+        } catch {
+            moveAllLiFiToRPC()
+            return .unknown
+        }
+    }
+
+    private func moveAllLiFiToRPC() {
+        guard !lifiKeys.isEmpty else { return }
+        for key in lifiKeys {
+            rpcKeys.insert(key)
+        }
+        lifiKeys.removeAll()
+        lastRPCRefresh = .distantPast   // 下一轮马上补价
+    }
+
+    /// LI.FI 也查不到时的最后一层兜底：BSC 直接读 PancakeSwap V2 的池子储备。
+    /// 每 15 秒最多一轮；ChainRPC 内部有 10 秒缓存和节点轮换。
+    private func refreshRPCIfNeeded() async -> DexScreenerError? {
+        guard Date().timeIntervalSince(lastRPCRefresh) >= rpcInterval else { return nil }
+        lastRPCRefresh = Date()
+        guard !rpcKeys.isEmpty else { return nil }
+
+        let snapshot = snapshotCoins()
+        var items: [(chainId: String, address: String)] = []
+        var coinsByID: [String: Coin] = [:]
+
+        for coin in snapshot {
+            guard case .dex(let chainId, let address) = coin.source else { continue }
+            let key = DexCandidates.pairKey(chainId: chainId, address: address)
+            guard rpcKeys.contains(key) else { continue }
+            items.append((chainId, address))
+            coinsByID[coin.id] = coin
+        }
+        guard !items.isEmpty else { return nil }
+
+        do {
+            let prices = try await ChainRPC.prices(items)
             let now = Date()
             for (coinId, price) in prices {
                 guard coinsByID[coinId] != nil else { continue }

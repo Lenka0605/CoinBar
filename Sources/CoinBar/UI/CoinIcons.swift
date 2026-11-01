@@ -69,7 +69,10 @@ final class CoinIcons: ObservableObject {
            let gate = URL(string: "https://icon.gateimg.com/images/coin_icon/64/\(sym.lowercased()).png") {
             list.append(gate)
         }
-        return list
+        // 大陆实测可直连的图标站排前面（海外同样可用），被墙的放后面，避免大陆用户每个币先等一轮超时
+        let reachableInCN = ["iconaves.com", "static.debank.com"]
+        let preferred = list.filter { u in reachableInCN.contains { u.host?.hasSuffix($0) == true } }
+        return preferred + list.filter { !preferred.contains($0) }
     }
 
     /// 依次尝试每个地址，拿到第一张有效图片就停
@@ -79,7 +82,7 @@ final class CoinIcons: ObservableObject {
         Task {
             var got: (Data, NSImage)?
             for url in urls {
-                var req = URLRequest(url: url, timeoutInterval: 8)
+                var req = URLRequest(url: url, timeoutInterval: 6)
                 req.setValue("Mozilla/5.0 CoinBar", forHTTPHeaderField: "User-Agent")
                 if let (data, resp) = try? await URLSession.shared.data(for: req),
                    (resp as? HTTPURLResponse)?.statusCode == 200,

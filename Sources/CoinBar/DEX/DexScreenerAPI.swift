@@ -153,6 +153,11 @@ struct DexLiquidity: Decodable {
     let quote: DexNumber?
 }
 
+/// 池子的附加信息，主要取代币图标
+struct DexInfo: Decodable {
+    let imageUrl: String?
+}
+
 struct DexPair: Decodable {
     let chainId: String
     let dexId: String?
@@ -162,6 +167,7 @@ struct DexPair: Decodable {
     let priceUsd: DexNumber?
     let priceChange: DexPriceChange?
     let liquidity: DexLiquidity?
+    let info: DexInfo?
 
     var price: Double? { priceUsd?.value }
     var liquidityUSD: Double { liquidity?.usd?.value ?? 0 }
@@ -175,25 +181,35 @@ struct DexResponse: Decodable {
 // MARK: - 把接口返回的池子整理成候选
 
 enum DexCandidates {
-    /// 同一个代币（chainId + 合约地址）可能有多个池子，取流动性最大的那个。
-    /// 结果按流动性从高到低排列。
-    static func build(from pairs: [DexPair], limit: Int = 30) -> [CoinCandidate] {
+    /// 同一个代币（chainId + 合约地址）可能有多个池子，价格取流动性最大的那个，
+    /// 图标取第一个带图的池子。结果按流动性从高到低排列。
+    ///
+    /// `onlyBaseAddress` 用于按合约地址精确查询：DexScreener 会把「该地址作为计价货币」
+    /// 的池子也返回，这些池子的 base 是别的币，不能算作候选。
+    static func build(from pairs: [DexPair], limit: Int = 30, onlyBaseAddress: String? = nil) -> [CoinCandidate] {
         var best: [String: DexPair] = [:]
+        var icons: [String: String] = [:]
+
         for pair in pairs {
             guard pair.price != nil,
                   let symbol = pair.baseToken.symbol, !symbol.isEmpty else { continue }
+            if let want = onlyBaseAddress, !addressEquals(pair.baseToken.address, want) { continue }
             let key = pairKey(chainId: pair.chainId, address: pair.baseToken.address)
+            if icons[key] == nil, let icon = pair.info?.imageUrl, !icon.isEmpty {
+                icons[key] = icon
+            }
             if let current = best[key], current.liquidityUSD >= pair.liquidityUSD { continue }
             best[key] = pair
         }
 
-        let candidates: [CoinCandidate] = best.values.map { pair in
+        let candidates: [CoinCandidate] = best.map { key, pair in
             let symbol = (pair.baseToken.symbol ?? "?").uppercased()
             let name = pair.baseToken.name ?? symbol
             let coin = Coin(
                 symbol: symbol,
                 name: name,
-                source: .dex(chainId: pair.chainId, address: pair.baseToken.address)
+                source: .dex(chainId: pair.chainId, address: pair.baseToken.address),
+                iconURL: icons[key]
             )
             return CoinCandidate(
                 coin: coin,
@@ -215,6 +231,14 @@ enum DexCandidates {
     /// provider 匹配价格用的 key
     static func pairKey(chainId: String, address: String) -> String {
         "\(chainId.lowercased()):\(address.lowercased())"
+    }
+
+    /// EVM 地址不区分大小写，Solana 等 base58 地址区分大小写
+    static func addressEquals(_ a: String, _ b: String) -> Bool {
+        if a.hasPrefix("0x") || b.hasPrefix("0x") {
+            return a.lowercased() == b.lowercased()
+        }
+        return a == b
     }
 
     static func chainDisplayName(_ chainId: String) -> String {

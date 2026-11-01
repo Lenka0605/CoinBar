@@ -16,7 +16,7 @@ enum DEXSearch {
         guard let url = DexScreenerAPI.tokensURL(addresses: [addr]) else { return [] }
 
         let response = try await DexScreenerAPI.get(url, as: DexResponse.self)
-        return DexCandidates.build(from: response.pairs ?? [], limit: 25)
+        return DexCandidates.build(from: response.pairs ?? [], limit: 25, onlyBaseAddress: addr)
     }
 
     /// 按名称 / 代号搜链上代币，结果按流动性从高到低。
@@ -26,6 +26,12 @@ enum DEXSearch {
     static func search(query: String) async throws -> [CoinCandidate] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return [] }
+
+        // 输入是合约地址时直接精确查询。模糊搜索会把「该地址作为计价货币」的池子
+        // 也返回，那些池子的 base 是别的币，混进来会误导用户。
+        if looksLikeContractAddress(q) {
+            return try await resolve(address: q)
+        }
 
         var candidates: [CoinCandidate] = []
         var firstError: DexScreenerError?
@@ -40,13 +46,6 @@ enum DEXSearch {
                 firstError = err
             } catch {
                 firstError = .unknown
-            }
-        }
-
-        if looksLikeContractAddress(q) {
-            // 精确查询失败不影响已经搜到的结果
-            if let exact = try? await resolve(address: q) {
-                candidates = exact + candidates
             }
         }
 

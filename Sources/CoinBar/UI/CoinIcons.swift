@@ -56,7 +56,14 @@ final class CoinIcons: ObservableObject {
     }
 
     private func remoteURL(_ coin: Coin) -> URL? {
-        if let s = coin.iconURL, let u = URL(string: s) { return u }
+        if let s = coin.iconURL, var c = URLComponents(string: s) {
+            // DexScreener 图片默认 800px，图标只需要 64px
+            if c.host?.contains("dexscreener") == true {
+                c.queryItems = [URLQueryItem(name: "width", value: "64"), URLQueryItem(name: "height", value: "64"),
+                                URLQueryItem(name: "format", value: "png")]
+            }
+            return c.url
+        }
         if case .cex(let sym) = coin.source {
             return URL(string: "https://icon.gateimg.com/images/coin_icon/64/\(sym.lowercased()).png")
         }

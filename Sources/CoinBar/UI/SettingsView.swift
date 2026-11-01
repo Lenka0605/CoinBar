@@ -67,7 +67,7 @@ struct SettingsView: View {
                 }
             }
             if searched && !searching && !dexLoading && result.candidates.isEmpty && result.dexNotice == nil {
-                Text("没有找到匹配的币").font(.caption).foregroundStyle(.secondary)
+                Text("没有找到匹配的币：Gate 交易所、DexScreener、GeckoTerminal 都没有收录。请确认地址或名称是否正确。").font(.caption).foregroundStyle(.secondary)
             }
             if !result.candidates.isEmpty {
                 List(result.candidates) { c in candidateRow(c) }

@@ -9,14 +9,46 @@ import Foundation
 enum DEXSearch {
     /// 合约地址 → 识别是哪条链、什么币。结果按流动性从高到低。
     ///
+    /// 先查 DexScreener；它没收录的币（很多新币、小币）再查 GeckoTerminal。
     /// 一个地址可能在多条链上都存在，所以返回的是候选列表，让用户确认。
     static func resolve(address: String) async throws -> [CoinCandidate] {
         let addr = address.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !addr.isEmpty else { return [] }
-        guard let url = DexScreenerAPI.tokensURL(addresses: [addr]) else { return [] }
 
-        let response = try await DexScreenerAPI.get(url, as: DexResponse.self)
-        return DexCandidates.build(from: response.pairs ?? [], limit: 25, onlyBaseAddress: addr)
+        var dexError: DexScreenerError?
+
+        if let url = DexScreenerAPI.tokensURL(addresses: [addr]) {
+            do {
+                let response = try await DexScreenerAPI.get(url, as: DexResponse.self)
+                let candidates = DexCandidates.build(from: response.pairs ?? [], limit: 25, onlyBaseAddress: addr)
+                if !candidates.isEmpty { return candidates }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let err as DexScreenerError {
+                dexError = err
+            } catch {
+                dexError = .unknown
+            }
+        }
+
+        return try await resolveWithGeckoTerminal(address: addr, dexError: dexError)
+    }
+
+    private static func resolveWithGeckoTerminal(address: String, dexError: DexScreenerError?) async throws -> [CoinCandidate] {
+        guard let url = GeckoTerminalAPI.searchPoolsURL(query: address) else { return [] }
+        do {
+            let response = try await GeckoTerminalAPI.get(url, as: GTResponse<GTPool>.self)
+            let candidates = GTCandidates.build(from: response.data ?? [], limit: 25, onlyBaseAddress: address)
+            if candidates.isEmpty { return [] }
+            return await GTCandidates.enriching(candidates)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            // 两个源都没成功：优先把 DexScreener 的错误抛出去，界面据此提示开代理
+            if let dexError { throw dexError }
+            if let geckoError = error as? DexScreenerError { throw geckoError }
+            throw DexScreenerError.unknown
+        }
     }
 
     /// 按名称 / 代号搜链上代币，结果按流动性从高到低。
@@ -46,6 +78,23 @@ enum DEXSearch {
                 firstError = err
             } catch {
                 firstError = .unknown
+            }
+        }
+
+        // DexScreener 没搜到，再试 GeckoTerminal（收录更全）
+        if candidates.isEmpty, let geckoURL = GeckoTerminalAPI.searchPoolsURL(query: q) {
+            do {
+                let response = try await GeckoTerminalAPI.get(geckoURL, as: GTResponse<GTPool>.self, maxAttempts: 2)
+                let geckoCandidates = GTCandidates.build(from: response.data ?? [], limit: 30)
+                if !geckoCandidates.isEmpty {
+                    candidates = await GTCandidates.enriching(geckoCandidates)
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                if firstError == nil {
+                    firstError = (error as? DexScreenerError) ?? .unknown
+                }
             }
         }
 

@@ -12,6 +12,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     private var rowItems: [String: NSMenuItem] = [:]
     private var updateItem = NSMenuItem()
     private var menuOpen = false
+    private var styleItems: [(NSMenuItem, () -> Bool)] = []
     var openSettings: () -> Void = {}
 
     override init() {
@@ -32,9 +33,10 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         store.$dexError.receive(on: DispatchQueue.main).sink { [weak self] _ in
             DispatchQueue.main.async { self?.rebuildMenu() }
         }.store(in: &bag)
-        store.$showChangeInBar.receive(on: DispatchQueue.main).sink { [weak self] _ in
-            DispatchQueue.main.async { self?.refreshTitle() }
-        }.store(in: &bag)
+        Publishers.Merge3(store.$showChangeInBar, store.$showIconInBar, store.$showSymbolInBar)
+            .receive(on: DispatchQueue.main).sink { [weak self] _ in
+                DispatchQueue.main.async { self?.refreshTitle(); self?.refreshStyleItems() }
+            }.store(in: &bag)
         CoinIcons.shared.$version.receive(on: DispatchQueue.main).sink { [weak self] _ in
             DispatchQueue.main.async { self?.refreshTitle(); self?.refreshRows() }
         }.store(in: &bag)
@@ -55,17 +57,20 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         }
         for (i, coin) in shown.enumerated() {
             if i > 0 { out.append(NSAttributedString(string: "   ", attributes: [.font: font])) }
-            let att = NSTextAttachment()
-            att.image = CoinIcons.shared.image(for: coin, size: 14)
-            att.bounds = CGRect(x: 0, y: -2.5, width: 14, height: 14)
-            out.append(NSAttributedString(attachment: att))
-            out.append(NSAttributedString(string: " ", attributes: [.font: font]))
+            if store.showIconInBar {
+                let att = NSTextAttachment()
+                att.image = CoinIcons.shared.image(for: coin, size: 14)
+                att.bounds = CGRect(x: 0, y: -2.5, width: 14, height: 14)
+                out.append(NSAttributedString(attachment: att))
+                out.append(NSAttributedString(string: " ", attributes: [.font: font]))
+            }
             let tick = store.prices[coin.id]
             let stale = store.isStale(coin)
             let price = tick.map { Fmt.price($0.priceUSD) } ?? "--"
             var attrs: [NSAttributedString.Key: Any] = [.font: font]
             if stale { attrs[.foregroundColor] = NSColor.tertiaryLabelColor }
-            out.append(NSAttributedString(string: "\(coin.symbol) \(price)", attributes: attrs))
+            out.append(NSAttributedString(string: store.showSymbolInBar ? "\(coin.symbol) \(price)" : price,
+                                          attributes: attrs))
             if store.showChangeInBar, !stale, let ch = tick?.change24h {
                 out.append(NSAttributedString(string: " \(Fmt.change(ch))",
                     attributes: [.font: small, .foregroundColor: ch >= 0 ? NSColor.systemGreen : NSColor.systemRed]))
@@ -98,6 +103,23 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             menu.addItem(warn)
         }
         menu.addItem(.separator())
+        // 菜单栏显示样式：一级菜单直接勾选
+        let styleMenu = NSMenu()
+        styleItems = []
+        for (title, sel, get) in [
+            ("显示图标", #selector(toggleIcon), { [unowned self] in self.store.showIconInBar }),
+            ("显示币种代号", #selector(toggleSymbol), { [unowned self] in self.store.showSymbolInBar }),
+            ("显示 24h 涨跌幅", #selector(toggleChange), { [unowned self] in self.store.showChangeInBar }),
+        ] as [(String, Selector, () -> Bool)] {
+            let mi = NSMenuItem(title: title, action: sel, keyEquivalent: "")
+            mi.target = self
+            styleMenu.addItem(mi)
+            styleItems.append((mi, get))
+        }
+        let styleRoot = NSMenuItem(title: "菜单栏显示", action: nil, keyEquivalent: "")
+        styleRoot.submenu = styleMenu
+        menu.addItem(styleRoot)
+        refreshStyleItems()
         add("添加币种 / 管理…", #selector(showSettings), ",")
         menu.addItem(.separator())
         updateItem = add("检查更新", #selector(updateAction), "")
@@ -159,6 +181,13 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     // MARK: 动作
+    private func refreshStyleItems() {
+        for (mi, get) in styleItems { mi.state = get() ? .on : .off }
+    }
+    @objc private func toggleIcon() { store.showIconInBar.toggle() }
+    @objc private func toggleSymbol() { store.showSymbolInBar.toggle() }
+    @objc private func toggleChange() { store.showChangeInBar.toggle() }
+
     func menuWillOpen(_ menu: NSMenu) { menuOpen = true; refreshRows() }
     func menuDidClose(_ menu: NSMenu) { menuOpen = false }
 

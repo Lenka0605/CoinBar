@@ -20,8 +20,11 @@ struct SettingsView: View {
             Divider()
             listSection
             Divider()
-            HStack {
-                Toggle("菜单栏显示 24h 涨跌幅", isOn: $store.showChangeInBar)
+            HStack(spacing: 14) {
+                Text("菜单栏显示：")
+                Toggle("图标", isOn: $store.showIconInBar)
+                Toggle("代号", isOn: $store.showSymbolInBar)
+                Toggle("24h 涨跌幅", isOn: $store.showChangeInBar)
                 Spacer()
                 Toggle("开机自动启动", isOn: $launchAtLogin)
                     .onChange(of: launchAtLogin) { on in

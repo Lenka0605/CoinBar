@@ -11,8 +11,15 @@ final class PriceStore: ObservableObject {
     /// 链上数据源整轮请求失败（大陆多半是没开代理）
     @Published private(set) var dexError: DexScreenerError?
     var hasDexCoins: Bool { coins.contains { if case .dex = $0.source { return true }; return false } }
+    // 菜单栏显示样式
     @Published var showChangeInBar: Bool {
         didSet { UserDefaults.standard.set(showChangeInBar, forKey: "showChangeInBar") }
+    }
+    @Published var showIconInBar: Bool {
+        didSet { UserDefaults.standard.set(showIconInBar, forKey: "showIconInBar") }
+    }
+    @Published var showSymbolInBar: Bool {
+        didSet { UserDefaults.standard.set(showSymbolInBar, forKey: "showSymbolInBar") }
     }
 
     private let cex = CEXProvider()
@@ -30,6 +37,8 @@ final class PriceStore: ObservableObject {
 
     private init() {
         showChangeInBar = UserDefaults.standard.object(forKey: "showChangeInBar") as? Bool ?? true
+        showIconInBar = UserDefaults.standard.object(forKey: "showIconInBar") as? Bool ?? true
+        showSymbolInBar = UserDefaults.standard.object(forKey: "showSymbolInBar") as? Bool ?? true
         if let data = UserDefaults.standard.data(forKey: key),
            let saved = try? JSONDecoder().decode([Coin].self, from: data) {
             coins = saved

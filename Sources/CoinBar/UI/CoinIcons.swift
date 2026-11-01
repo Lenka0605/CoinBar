@@ -69,10 +69,27 @@ final class CoinIcons: ObservableObject {
            let gate = URL(string: "https://icon.gateimg.com/images/coin_icon/64/\(sym.lowercased()).png") {
             list.append(gate)
         }
+        // 链上币：按链 + 地址推出公开图标库的地址。旧版本添加的币没存图标地址，也能用上
+        if case .dex(let chain, let address) = coin.source {
+            list += Self.derivedIconURLs(chain: chain, address: address).filter { !list.contains($0) }
+        }
         // 大陆实测可直连的图标站排前面（海外同样可用），被墙的放后面，避免大陆用户每个币先等一轮超时
         let reachableInCN = ["iconaves.com", "static.debank.com"]
         let preferred = list.filter { u in reachableInCN.contains { u.host?.hasSuffix($0) == true } }
         return preferred + list.filter { !preferred.contains($0) }
+    }
+
+    /// 不需要 key 的公开图标库（Ave 图标 CDN 大陆可直连；DexScreener 海外可用）
+    static func derivedIconURLs(chain: String, address: String) -> [URL] {
+        let isEVM = address.hasPrefix("0x")
+        let addr = isEVM ? address.lowercased() : address      // Solana 地址区分大小写
+        let aveNet: [String: String] = ["ethereum": "eth", "bsc": "bsc", "solana": "solana", "base": "base",
+                                        "arbitrum": "arbitrum", "polygon": "polygon"]
+        var out: [URL] = []
+        if let net = aveNet[chain.lowercased()],
+           let u = URL(string: "https://www.iconaves.com/token_icon/\(net)/\(addr).png") { out.append(u) }
+        if let u = URL(string: "https://dd.dexscreener.com/ds-data/tokens/\(chain.lowercased())/\(addr).png") { out.append(u) }
+        return out
     }
 
     /// 依次尝试每个地址，拿到第一张有效图片就停

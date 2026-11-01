@@ -25,12 +25,17 @@ final class DEXProvider: PriceProvider {
     private let requestDelay: TimeInterval = 0.2
     /// GeckoTerminal 刷新间隔（限额 30 次/分钟）
     private let geckoInterval: TimeInterval = 30
+    /// LI.FI 刷新间隔（接口有约 5 分钟缓存，60 秒调一次不浪费额度）
+    private let lifiInterval: TimeInterval = 60
     /// 每隔一段时间重新给 DexScreener 一次机会，防止它后来收录了
     private let dexRetryInterval: TimeInterval = 900
 
     /// 改走 GeckoTerminal 的币，key 是 chainId:address。只在轮询任务里读写
     private var geckoKeys: Set<String> = []
+    /// GeckoTerminal 也查不到的币，改走 LI.FI
+    private var lifiKeys: Set<String> = []
     private var lastGeckoRefresh = Date.distantPast
+    private var lastLiFiRefresh = Date.distantPast
     private var lastDexRetry = Date()
 
     private let lock = NSLock()
@@ -121,7 +126,16 @@ final class DEXProvider: PriceProvider {
             if Task.isCancelled { return }
             let geckoError = await refreshGeckoIfNeeded()
             if Task.isCancelled { return }
-            if error == nil { error = geckoError }
+            let lifiError = await refreshLiFiIfNeeded()
+            if Task.isCancelled { return }
+
+            if !lifiKeys.isEmpty, lifiError == nil {
+                // LI.FI 正在给兜底币供价，前两层的网络错误就不算整体故障
+                error = nil
+            } else {
+                if error == nil { error = geckoError }
+                if error == nil { error = lifiError }
+            }
             reportStatus(error)
 
             // 一轮固定 10 秒（含请求耗时），请求多时不会把周期越拖越长
@@ -151,6 +165,7 @@ final class DEXProvider: PriceProvider {
         if Date().timeIntervalSince(lastDexRetry) >= dexRetryInterval {
             lastDexRetry = Date()
             geckoKeys.removeAll()
+            lifiKeys.removeAll()
         }
 
         let snapshot = snapshotCoins()
@@ -195,9 +210,9 @@ final class DEXProvider: PriceProvider {
         for (i, address) in batch.enumerated() {
             if Task.isCancelled { return nil }
 
-            // 这个地址的币都已经交给 GeckoTerminal 了，就别再浪费 DexScreener 的额度
+            // 这个地址的币都已经交给 GeckoTerminal / LI.FI 了，就别再浪费 DexScreener 的额度
             let keys = addressKeys[address] ?? []
-            if !keys.isEmpty, keys.allSatisfy({ geckoKeys.contains($0) }) {
+            if !keys.isEmpty, keys.allSatisfy({ geckoKeys.contains($0) || lifiKeys.contains($0) }) {
                 continue
             }
 
@@ -235,10 +250,10 @@ final class DEXProvider: PriceProvider {
         // 新发现的币需要马上让 GeckoTerminal 补价
         if addedGeckoKey { lastGeckoRefresh = .distantPast }
 
-        // 所有币都已经走 GeckoTerminal 时，DexScreener 失败就不算整体故障
-        let allOnGecko = wanted.keys.allSatisfy { geckoKeys.contains($0) }
+        // 所有币都已经交给兜底源时，DexScreener 失败就不算整体故障
+        let allOnFallback = wanted.keys.allSatisfy { geckoKeys.contains($0) || lifiKeys.contains($0) }
         // 只有整轮全军覆没才当作数据源故障，部分失败是单个币的问题
-        guard attempted > 0, failed == attempted, !allOnGecko else { return nil }
+        guard attempted > 0, failed == attempted, !allOnFallback else { return nil }
         return lastError ?? .unknown
     }
 
@@ -303,6 +318,7 @@ final class DEXProvider: PriceProvider {
         var failed = 0
         var lastError: DexScreenerError?
         var didRequest = false
+        var matched: Set<String> = []
 
         for (network, entries) in groups {
             if Task.isCancelled { return nil }
@@ -325,7 +341,8 @@ final class DEXProvider: PriceProvider {
                 }
                 do {
                     let response = try await GeckoTerminalAPI.get(url, as: GTResponse<GTToken>.self, maxAttempts: 2)
-                    emitGecko(tokens: response.data ?? [], included: response.included ?? [], network: network, entries: entries)
+                    matched.formUnion(emitGecko(tokens: response.data ?? [], included: response.included ?? [],
+                                                network: network, entries: entries))
                 } catch is CancellationError {
                     return nil
                 } catch let err as DexScreenerError {
@@ -338,14 +355,66 @@ final class DEXProvider: PriceProvider {
             }
         }
 
+        // Gecko 也查不到（或整体连不上）的币，交给 LI.FI 兜底
+        if attempted > 0 {
+            let missed = geckoKeys.subtracting(matched)
+            if !missed.isEmpty {
+                for key in missed {
+                    geckoKeys.remove(key)
+                    lifiKeys.insert(key)
+                }
+                lastLiFiRefresh = .distantPast   // 下一轮马上补价
+            }
+        }
+
         guard attempted > 0, failed == attempted else { return nil }
         return lastError ?? .unknown
     }
 
+    /// GeckoTerminal 也不可用的币，每 60 秒用 LI.FI 批量取一次价。
+    /// LI.FI 无需 key，大陆可直连，但上游价格有约 5 分钟缓存。
+    private func refreshLiFiIfNeeded() async -> DexScreenerError? {
+        guard Date().timeIntervalSince(lastLiFiRefresh) >= lifiInterval else { return nil }
+        lastLiFiRefresh = Date()
+        guard !lifiKeys.isEmpty else { return nil }
+
+        let snapshot = snapshotCoins()
+        var items: [(chainId: String, address: String)] = []
+        var coinsByID: [String: Coin] = [:]
+
+        for coin in snapshot {
+            guard case .dex(let chainId, let address) = coin.source else { continue }
+            let key = DexCandidates.pairKey(chainId: chainId, address: address)
+            guard lifiKeys.contains(key) else { continue }
+            items.append((chainId, address))
+            coinsByID[coin.id] = coin
+        }
+        guard !items.isEmpty else { return nil }
+
+        do {
+            let prices = try await LiFiAPI.prices(items)
+            let now = Date()
+            for (coinId, price) in prices {
+                guard coinsByID[coinId] != nil else { continue }
+                let tick = PriceTick(coinId: coinId, priceUSD: price, change24h: nil, timestamp: now)
+                onTick?(tick)
+            }
+            return nil
+        } catch is CancellationError {
+            return nil
+        } catch let err as DexScreenerError {
+            return err
+        } catch {
+            return .unknown
+        }
+    }
+
+    @discardableResult
     private func emitGecko(tokens: [GTToken], included: [GTPoolSummary], network: String,
-                           entries: [(address: String, coin: Coin)]) {
+                           entries: [(address: String, coin: Coin)]) -> Set<String> {
         let chainId = GeckoTerminalAPI.dexChainId(fromNetwork: network)
         let now = Date()
+        var matched: Set<String> = []
 
         var poolsByID: [String: GTPoolSummary] = [:]
         for pool in included {
@@ -366,6 +435,7 @@ final class DEXProvider: PriceProvider {
             for entry in entries where DexCandidates.addressEquals(entry.address, address) {
                 guard case .dex(let coinChainId, _) = entry.coin.source,
                       coinChainId.lowercased() == chainId.lowercased() else { continue }
+                matched.insert(DexCandidates.pairKey(chainId: coinChainId, address: entry.address))
                 let tick = PriceTick(
                     coinId: entry.coin.id,
                     priceUSD: price,
@@ -375,6 +445,7 @@ final class DEXProvider: PriceProvider {
                 onTick?(tick)
             }
         }
+        return matched
     }
 
     private func chunked<T>(_ items: [T], size: Int) -> [[T]] {

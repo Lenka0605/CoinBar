@@ -9,45 +9,64 @@ import Foundation
 enum DEXSearch {
     /// 合约地址 → 识别是哪条链、什么币。结果按流动性从高到低。
     ///
-    /// 先查 DexScreener；它没收录的币（很多新币、小币）再查 GeckoTerminal。
+    /// 依次尝试三个数据源：DexScreener → GeckoTerminal → LI.FI。
+    /// 前两个在大陆被墙时，LI.FI 是能直连的兜底。
     /// 一个地址可能在多条链上都存在，所以返回的是候选列表，让用户确认。
     static func resolve(address: String) async throws -> [CoinCandidate] {
         let addr = address.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !addr.isEmpty else { return [] }
 
-        var dexError: DexScreenerError?
+        var lastError: DexScreenerError?
 
+        // 1. DexScreener
         if let url = DexScreenerAPI.tokensURL(addresses: [addr]) {
             do {
                 let response = try await DexScreenerAPI.get(url, as: DexResponse.self)
                 let candidates = DexCandidates.build(from: response.pairs ?? [], limit: 25, onlyBaseAddress: addr)
-                if !candidates.isEmpty { return candidates }
+                if !candidates.isEmpty { return withIconFallbacks(candidates) }
             } catch is CancellationError {
                 throw CancellationError()
             } catch let err as DexScreenerError {
-                dexError = err
+                lastError = err
             } catch {
-                dexError = .unknown
+                lastError = .unknown
             }
         }
 
-        return try await resolveWithGeckoTerminal(address: addr, dexError: dexError)
+        // 2. GeckoTerminal
+        let (geckoCandidates, geckoError) = try await resolveWithGeckoTerminal(address: addr)
+        if !geckoCandidates.isEmpty { return withIconFallbacks(geckoCandidates) }
+        if lastError == nil { lastError = geckoError }
+
+        // 3. LI.FI（大陆可直连，约 5 分钟缓存）
+        do {
+            let candidates = try await LiFiAPI.resolve(address: addr)
+            if !candidates.isEmpty { return withIconFallbacks(candidates) }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let err as DexScreenerError {
+            if lastError == nil { lastError = err }
+        } catch {
+            if lastError == nil { lastError = .unknown }
+        }
+
+        if let lastError { throw lastError }
+        return []
     }
 
-    private static func resolveWithGeckoTerminal(address: String, dexError: DexScreenerError?) async throws -> [CoinCandidate] {
-        guard let url = GeckoTerminalAPI.searchPoolsURL(query: address) else { return [] }
+    private static func resolveWithGeckoTerminal(address: String) async throws -> ([CoinCandidate], DexScreenerError?) {
+        guard let url = GeckoTerminalAPI.searchPoolsURL(query: address) else { return ([], nil) }
         do {
             let response = try await GeckoTerminalAPI.get(url, as: GTResponse<GTPool>.self)
             let candidates = GTCandidates.build(from: response.data ?? [], limit: 25, onlyBaseAddress: address)
-            if candidates.isEmpty { return [] }
-            return await GTCandidates.enriching(candidates)
+            guard !candidates.isEmpty else { return ([], nil) }
+            return (await GTCandidates.enriching(candidates), nil)
         } catch is CancellationError {
             throw CancellationError()
+        } catch let err as DexScreenerError {
+            return ([], err)
         } catch {
-            // 两个源都没成功：优先把 DexScreener 的错误抛出去，界面据此提示开代理
-            if let dexError { throw dexError }
-            if let geckoError = error as? DexScreenerError { throw geckoError }
-            throw DexScreenerError.unknown
+            return ([], .unknown)
         }
     }
 
@@ -111,7 +130,65 @@ enum DEXSearch {
         if sorted.isEmpty, let firstError {
             throw firstError
         }
-        return Array(sorted.prefix(30))
+        return withIconFallbacks(Array(sorted.prefix(30)))
+    }
+
+    /// 给链上候选补上多个图标地址，按优先顺序排：
+    /// DexScreener → GeckoTerminal → LI.FI，Ave 的 CDN 放最后兜底（它不需要 key，大陆可直连）。
+    /// CoinIcons 会依次尝试，前一个下载失败就换下一个。
+    private static func withIconFallbacks(_ candidates: [CoinCandidate]) -> [CoinCandidate] {
+        candidates.map { candidate in
+            guard case .dex(let chainId, let address) = candidate.coin.source else { return candidate }
+            // Solana 地址区分大小写，URL 里必须原样保留；EVM 地址用小写
+            let pathAddress = chainId.lowercased() == "solana" ? address : address.lowercased()
+
+            // (排序优先级, 原顺序, 地址)
+            var urls: [(rank: Int, order: Int, url: String)] = []
+            urls.append((0, 0, "https://dd.dexscreener.com/ds-data/tokens/\(chainId.lowercased())/\(pathAddress).png"))
+            if let own = candidate.coin.iconURL {
+                urls.append((iconRank(own), 1, own))
+            }
+            if let ave = aveIconURL(chainId: chainId, address: pathAddress) {
+                urls.append((3, 2, ave))
+            }
+
+            let sorted = urls.sorted { lhs, rhs in
+                if lhs.rank != rhs.rank { return lhs.rank < rhs.rank }
+                return lhs.order < rhs.order
+            }
+            var seen = Set<String>()
+            let unique = sorted.map(\.url).filter { !$0.isEmpty && seen.insert($0).inserted }
+            guard !unique.isEmpty else { return candidate }
+
+            var coin = candidate.coin
+            coin.iconURL = unique.first
+            coin.altIconURLs = unique.count > 1 ? Array(unique.dropFirst()) : nil
+            return CoinCandidate(coin: coin, priceUSD: candidate.priceUSD,
+                                 liquidityUSD: candidate.liquidityUSD, detail: candidate.detail)
+        }
+    }
+
+    /// 数据源图标的优先级：DexScreener → GeckoTerminal → LI.FI 等
+    private static func iconRank(_ url: String) -> Int {
+        let lower = url.lowercased()
+        if lower.contains("dexscreener") { return 0 }
+        if lower.contains("geckoterminal") || lower.contains("coingecko") { return 1 }
+        return 2
+    }
+
+    /// Ave 的图标 CDN，大陆实测可直连。链名对不上的不生成，避免无谓的下载尝试。
+    private static func aveIconURL(chainId: String, address: String) -> String? {
+        let network: String
+        switch chainId.lowercased() {
+        case "bsc": network = "bsc"
+        case "ethereum": network = "eth"
+        case "solana": network = "solana"
+        case "polygon": network = "polygon"
+        case "base": network = "base"
+        case "arbitrum": network = "arbitrum"
+        default: return nil
+        }
+        return "https://www.iconaves.com/token_icon/\(network)/\(address).png"
     }
 
     /// 0x 开头的 40 位十六进制（EVM），或 32~44 位 base58（Solana）视为合约地址

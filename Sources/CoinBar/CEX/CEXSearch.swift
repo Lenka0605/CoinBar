@@ -166,14 +166,10 @@ actor GateTickerCache {
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 3)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         let (data, response) = try await session.data(for: request)
-        guard let response = response as? HTTPURLResponse, response.statusCode == 200,
-              let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { throw TickerError.invalid }
+        guard let response = response as? HTTPURLResponse, response.statusCode == 200 else { throw TickerError.invalid }
         var prices: [String: Double] = [:]
-        for row in rows {
-            guard let pair = row["currency_pair"] as? String, pair.hasSuffix("_USDT"),
-                  let price = CEXWire.number(row["last"]), price > 0 else { continue }
-            let symbol = String(pair.dropLast(5))
-            if !symbol.isEmpty { prices[symbol] = price }
+        for quote in try CEXWire.restQuotes(from: data, timestamp: Date()) {
+            prices[quote.symbol] = quote.price
         }
         return prices
     }

@@ -74,12 +74,12 @@ final class PriceStore: ObservableObject {
         }
     }
 
-    /// 超过阈值没更新视为数据陈旧。交易所只在价格变动时推送，冷门币可能很久不动，给 180 秒；
+    /// 超过阈值没更新视为数据陈旧。交易所有 WS 推送 + 每 60 秒 REST 补价，给 90 秒；
     /// 链上每轮都会回 tick，但币多时会轮转，给 120 秒
     func isStale(_ coin: Coin, now: Date = Date()) -> Bool {
         guard let t = prices[coin.id] else { return true }
         let limit: TimeInterval
-        if case .dex = coin.source { limit = 120 } else { limit = 180 }
+        if case .dex = coin.source { limit = 120 } else { limit = 90 }
         return now.timeIntervalSince(t.timestamp) > limit
     }
 

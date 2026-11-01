@@ -2,6 +2,8 @@ import Foundation
 
 /// Gate 优先；断线或单个币超过 12 秒未收到行情时，按币种补订 Binance 行情专用源。
 /// Gate 在后台重连，恢复有效行情后自动移除对应的 Binance 订阅。
+/// 启动/新增订阅时立即用 Gate REST 补价，之后每 60 秒全量核验一次。
+/// REST 的 tick.timestamp 表示本次核验起点，并非该币最后一笔成交的时间。
 /// 备用仅覆盖 Binance 已上市的现货交易对，界面可依据 tick.timestamp 标明陈旧行情。
 /// 官方协议：github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md
 ///          www.gate.com/docs/developers/apiv4/ws/en/
@@ -17,18 +19,28 @@ final class CEXProvider: PriceProvider {
     private var coins: [String: Coin] = [:]
     private var lastPrimary: [String: TimeInterval] = [:]
     private var lastEmitted: [String: Date] = [:]
+    private var subscriptions: [String: UUID] = [:]
     private var primaryFailed = false
     private var running = false
     private var timer: DispatchSourceTimer?
+    private var snapshotTimer: DispatchSourceTimer?
+    private var snapshotTask: URLSessionDataTask?
+    private var snapshotRequestID: UUID?
+    private var snapshotPending = false
     private let gateURL: URL
     private let binanceURL: URL
+    private let restSession: URLSession
+    private let snapshotInterval: TimeInterval
     private lazy var primary = makeSocket(.gate)
     private lazy var backup = makeSocket(.binance)
 
     init(gateURL: URL = CEXExchange.gate.webSocketURL,
-         binanceURL: URL = CEXExchange.binance.webSocketURL) {
+         binanceURL: URL = CEXExchange.binance.webSocketURL,
+         restSession: URLSession = .shared, snapshotInterval: TimeInterval = 60) {
         self.gateURL = gateURL
         self.binanceURL = binanceURL
+        self.restSession = restSession
+        self.snapshotInterval = max(0.1, snapshotInterval)
     }
 
     func setCoins(_ coins: [Coin]) {
@@ -41,13 +53,21 @@ final class CEXProvider: PriceProvider {
                 next[symbol] = coin
             }
             let now = ProcessInfo.processInfo.systemUptime
+            let added = Set(next.keys).subtracting(self.coins.keys)
             self.lastPrimary = self.lastPrimary.filter { next[$0.key] != nil }
             self.lastEmitted = self.lastEmitted.filter { next[$0.key] != nil }
+            self.subscriptions = self.subscriptions.filter { next[$0.key] != nil }
+            for symbol in added { self.subscriptions[symbol] = UUID() }
             for symbol in next.keys where self.coins[symbol] == nil { self.lastPrimary[symbol] = now }
             self.coins = next
             guard self.running else { return }
             self.primary.setSymbols(Set(next.keys))
             self.updateBackup()
+            if next.isEmpty { self.stopSnapshots() }
+            else {
+                self.startSnapshotTimer()
+                if !added.isEmpty { self.requestSnapshot() }
+            }
         }
     }
 
@@ -60,6 +80,8 @@ final class CEXProvider: PriceProvider {
             self.lastPrimary = self.coins.mapValues { _ in now }
             self.lastEmitted.removeAll()
             self.primary.setSymbols(Set(self.coins.keys))
+            self.startSnapshotTimer()
+            self.requestSnapshot()
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
             timer.schedule(deadline: .now() + 2, repeating: 2)
             timer.setEventHandler { [weak self] in self?.updateBackup() }
@@ -76,12 +98,75 @@ final class CEXProvider: PriceProvider {
             self.timer = nil
             self.primary.setSymbols([])
             self.backup.setSymbols([])
+            self.stopSnapshots()
             self.lastPrimary.removeAll()
             self.lastEmitted.removeAll()
         }
     }
 
-    deinit { timer?.cancel() }
+    deinit {
+        timer?.cancel()
+        snapshotTimer?.cancel()
+        snapshotTask?.cancel()
+    }
+
+    private func startSnapshotTimer() {
+        guard snapshotTimer == nil, running, !coins.isEmpty else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + snapshotInterval, repeating: snapshotInterval)
+        timer.setEventHandler { [weak self] in self?.requestSnapshot() }
+        snapshotTimer = timer
+        timer.resume()
+    }
+
+    private func stopSnapshots() {
+        snapshotTimer?.cancel()
+        snapshotTimer = nil
+        snapshotRequestID = nil
+        snapshotTask?.cancel()
+        snapshotTask = nil
+        snapshotPending = false
+    }
+
+    private func requestSnapshot() {
+        guard running, !coins.isEmpty else { return }
+        guard snapshotTask == nil else {
+            // 在途请求期间新增订阅只合并成一轮补查，不为每个币单独发请求。
+            snapshotPending = true
+            return
+        }
+        let requestID = UUID()
+        let subscribed = subscriptions
+        // 接口没有逐币时间戳：用请求起点保守排序，避免覆盖在途期间的新推送。
+        let timestamp = Date()
+        let url = URL(string: "https://api.gateio.ws/api/v4/spot/tickers")!
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        snapshotRequestID = requestID
+        let task = restSession.dataTask(with: request) { [weak self] data, response, error in
+            guard let self else { return }
+            self.queue.async { [weak self] in
+                guard let self, self.running, self.snapshotRequestID == requestID else { return }
+                self.snapshotTask = nil
+                self.snapshotRequestID = nil
+                if error == nil, let http = response as? HTTPURLResponse, http.statusCode == 200,
+                   let data, let quotes = try? CEXWire.restQuotes(from: data, timestamp: timestamp) {
+                    for quote in quotes where subscribed[quote.symbol] != nil
+                        && self.subscriptions[quote.symbol] == subscribed[quote.symbol] {
+                        // REST 成功不代表 WebSocket 恢复，保持其重连与备用判断独立。
+                        self.emit(quote)
+                    }
+                }
+                if self.snapshotPending {
+                    self.snapshotPending = false
+                    self.requestSnapshot()
+                }
+            }
+        }
+        snapshotTask = task
+        task.resume()
+    }
 
     private func makeSocket(_ exchange: CEXExchange) -> CEXSocket {
         CEXSocket(exchange: exchange, url: exchange == .gate ? gateURL : binanceURL,
@@ -103,7 +188,7 @@ final class CEXProvider: PriceProvider {
     }
 
     private func received(_ quote: CEXQuote, from exchange: CEXExchange) {
-        guard running, let coin = coins[quote.symbol] else { return }
+        guard running, coins[quote.symbol] != nil else { return }
         let now = ProcessInfo.processInfo.systemUptime
         if exchange == .gate {
             lastPrimary[quote.symbol] = now
@@ -112,6 +197,11 @@ final class CEXProvider: PriceProvider {
         } else if !primaryFailed && now - (lastPrimary[quote.symbol] ?? 0) < 12 {
             return
         }
+        emit(quote)
+    }
+
+    private func emit(_ quote: CEXQuote) {
+        guard running, let coin = coins[quote.symbol] else { return }
         // 切换数据源时不允许较旧的数据覆盖已经显示的较新数据。
         guard quote.timestamp >= (lastEmitted[quote.symbol] ?? .distantPast) else { return }
         lastEmitted[quote.symbol] = quote.timestamp

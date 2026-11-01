@@ -46,6 +46,18 @@ struct CEXQuote {
 }
 
 enum CEXWire {
+    static func restQuotes(from data: Data, timestamp: Date) throws -> [CEXQuote] {
+        guard let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            throw WireError.invalidPayload
+        }
+        return rows.compactMap { row in
+            guard let pair = row["currency_pair"] as? String, pair.hasSuffix("_USDT"),
+                  !pair.dropLast(5).isEmpty, let price = number(row["last"]), price > 0 else { return nil }
+            return CEXQuote(symbol: String(pair.dropLast(5)), price: price,
+                            change24h: number(row["change_percentage"]), timestamp: timestamp)
+        }
+    }
+
     static func quotes(from object: [String: Any], exchange: CEXExchange) -> [CEXQuote] {
         switch exchange {
         case .gate:
@@ -90,4 +102,6 @@ enum CEXWire {
         return CEXQuote(symbol: symbol, price: price, change24h: change,
                         timestamp: Date(timeIntervalSince1970: milliseconds / 1000))
     }
+
+    private enum WireError: Error { case invalidPayload }
 }
